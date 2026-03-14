@@ -390,6 +390,9 @@ macro_rules! setup_builder {
 
 pub(crate) use setup_builder;
 
+#[cfg(any(cln_test, lnd_test, eclair_test))]
+pub(crate) mod scenarios;
+
 pub(crate) fn setup_two_nodes(
 	chain_source: &TestChainSource, allow_0conf: bool, anchor_channels: bool,
 	anchors_trusted_no_reserve: bool,
