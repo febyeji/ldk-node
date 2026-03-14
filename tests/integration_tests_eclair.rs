@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-#![cfg(cln_test)]
+#![cfg(eclair_test)]
 
 mod common;
 
@@ -18,19 +18,20 @@ use ldk_node::{Builder, Event};
 use proptest::prelude::*;
 use proptest::proptest;
 
-use common::cln::TestClnNode;
+use common::eclair::TestEclairNode;
 use common::external_node::ExternalNode;
 use common::scenarios::*;
 
-fn setup_clients() -> (BitcoindClient, ElectrumClient, TestClnNode) {
+fn setup_clients() -> (BitcoindClient, ElectrumClient, TestEclairNode) {
 	let bitcoind = BitcoindClient::new_with_auth(
 		"http://127.0.0.1:18443",
 		Auth::UserPass("user".to_string(), "pass".to_string()),
 	)
 	.unwrap();
 	let electrs = ElectrumClient::new("tcp://127.0.0.1:50001").unwrap();
-	let cln = TestClnNode::from_env();
-	(bitcoind, electrs, cln)
+
+	let eclair = TestEclairNode::from_env();
+	(bitcoind, electrs, eclair)
 }
 
 fn setup_ldk_node() -> ldk_node::Node {
@@ -43,96 +44,92 @@ fn setup_ldk_node() -> ldk_node::Node {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn test_cln_basic_channel_cycle() {
-	let (bitcoind, electrs, cln) = setup_clients();
-	cln.wait_for_sync().await;
+async fn test_eclair_basic_channel_cycle() {
+	let (bitcoind, electrs, eclair) = setup_clients();
 	common::generate_blocks_and_wait(&bitcoind, &electrs, 1).await;
 
 	let node = setup_ldk_node();
-	setup_interop_test(&node, &cln, &bitcoind, &electrs).await;
+	setup_interop_test(&node, &eclair, &bitcoind, &electrs).await;
 
 	let (user_channel_id, _ext_channel_id) =
-		open_channel_to_external(&node, &cln, &bitcoind, &electrs, 1_000_000, Some(500_000_000))
+		open_channel_to_external(&node, &eclair, &bitcoind, &electrs, 1_000_000, Some(500_000_000))
 			.await;
 
-	// LDK -> CLN payment
-	let invoice = cln.create_invoice(10_000_000, "cln-test-send").await.unwrap();
+	// LDK -> Eclair payment
+	let invoice = eclair.create_invoice(10_000_000, "eclair-test-send").await.unwrap();
 	let parsed = lightning_invoice::Bolt11Invoice::from_str(&invoice).unwrap();
 	node.bolt11_payment().send(&parsed, None).unwrap();
 	common::expect_event!(node, PaymentSuccessful);
 
-	// CLN -> LDK payment
+	// Eclair -> LDK payment
 	let ldk_invoice = node
 		.bolt11_payment()
 		.receive(
 			10_000_000,
 			&lightning_invoice::Bolt11InvoiceDescription::Direct(
-				lightning_invoice::Description::new("cln-test-recv".to_string()).unwrap(),
+				lightning_invoice::Description::new("eclair-test-recv".to_string()).unwrap(),
 			),
 			3600,
 		)
 		.unwrap();
-	cln.pay_invoice(&ldk_invoice.to_string()).await.unwrap();
+	eclair.pay_invoice(&ldk_invoice.to_string()).await.unwrap();
 	common::expect_event!(node, PaymentReceived);
 
-	test_cooperative_close_by_ldk(&node, &cln, &user_channel_id).await;
+	test_cooperative_close_by_ldk(&node, &eclair, &user_channel_id).await;
 	node.stop().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn test_cln_disconnect_reconnect() {
-	let (bitcoind, electrs, cln) = setup_clients();
-	cln.wait_for_sync().await;
+async fn test_eclair_disconnect_reconnect() {
+	let (bitcoind, electrs, eclair) = setup_clients();
 	common::generate_blocks_and_wait(&bitcoind, &electrs, 1).await;
 
 	let node = setup_ldk_node();
-	setup_interop_test(&node, &cln, &bitcoind, &electrs).await;
+	setup_interop_test(&node, &eclair, &bitcoind, &electrs).await;
 	let (_user_ch, _ext_ch) =
-		open_channel_to_external(&node, &cln, &bitcoind, &electrs, 1_000_000, Some(500_000_000))
+		open_channel_to_external(&node, &eclair, &bitcoind, &electrs, 1_000_000, Some(500_000_000))
 			.await;
 
-	test_disconnect_reconnect_idle(&node, &cln, &bitcoind, &electrs, &Side::Ldk).await;
-	test_disconnect_reconnect_idle(&node, &cln, &bitcoind, &electrs, &Side::External).await;
+	test_disconnect_reconnect_idle(&node, &eclair, &bitcoind, &electrs, &Side::Ldk).await;
+	test_disconnect_reconnect_idle(&node, &eclair, &bitcoind, &electrs, &Side::External).await;
 
 	node.stop().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn test_cln_force_close_by_ldk() {
-	let (bitcoind, electrs, cln) = setup_clients();
-	cln.wait_for_sync().await;
+async fn test_eclair_force_close_by_ldk() {
+	let (bitcoind, electrs, eclair) = setup_clients();
 	common::generate_blocks_and_wait(&bitcoind, &electrs, 1).await;
 
 	let node = setup_ldk_node();
-	setup_interop_test(&node, &cln, &bitcoind, &electrs).await;
+	setup_interop_test(&node, &eclair, &bitcoind, &electrs).await;
 	let (user_ch, _ext_ch) =
-		open_channel_to_external(&node, &cln, &bitcoind, &electrs, 1_000_000, Some(500_000_000))
+		open_channel_to_external(&node, &eclair, &bitcoind, &electrs, 1_000_000, Some(500_000_000))
 			.await;
 
-	test_force_close_by_ldk(&node, &cln, &bitcoind, &electrs, &user_ch).await;
+	test_force_close_by_ldk(&node, &eclair, &bitcoind, &electrs, &user_ch).await;
 	node.stop().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn test_cln_force_close_by_external() {
-	let (bitcoind, electrs, cln) = setup_clients();
-	cln.wait_for_sync().await;
+async fn test_eclair_force_close_by_external() {
+	let (bitcoind, electrs, eclair) = setup_clients();
 	common::generate_blocks_and_wait(&bitcoind, &electrs, 1).await;
 
 	let node = setup_ldk_node();
-	setup_interop_test(&node, &cln, &bitcoind, &electrs).await;
+	setup_interop_test(&node, &eclair, &bitcoind, &electrs).await;
 	let (_user_ch, ext_ch) =
-		open_channel_to_external(&node, &cln, &bitcoind, &electrs, 1_000_000, Some(500_000_000))
+		open_channel_to_external(&node, &eclair, &bitcoind, &electrs, 1_000_000, Some(500_000_000))
 			.await;
 
-	test_force_close_by_external(&node, &cln, &bitcoind, &electrs, &ext_ch).await;
+	test_force_close_by_external(&node, &eclair, &bitcoind, &electrs, &ext_ch).await;
 	node.stop().unwrap();
 }
 
 proptest! {
 	#![proptest_config(proptest::test_runner::Config::with_cases(8))]
 	#[test]
-	fn test_cln_interop_proptest(
+	fn test_eclair_interop_proptest(
 		disconnect_phase in prop_oneof![
 			Just(Phase::ChannelOpen),
 			Just(Phase::Payment),
@@ -149,13 +146,12 @@ proptest! {
 			.build()
 			.unwrap();
 		rt.block_on(async {
-			let (bitcoind, electrs, cln) = setup_clients();
-			cln.wait_for_sync().await;
+			let (bitcoind, electrs, eclair) = setup_clients();
 			common::generate_blocks_and_wait(&bitcoind, &electrs, 1).await;
 
 			let node = setup_ldk_node();
 			run_interop_property_test(
-				&node, &cln, &bitcoind, &electrs,
+				&node, &eclair, &bitcoind, &electrs,
 				disconnect_phase, disconnect_initiator, close_type,
 				close_initiator, payment_type,
 			).await;
