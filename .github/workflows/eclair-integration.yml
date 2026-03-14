@@ -1,0 +1,50 @@
+name: CI Checks - Eclair Integration Tests
+
+on: [push, pull_request]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-eclair:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Start bitcoind and electrs
+        run: docker compose up -d
+
+      - name: Wait for bitcoind to be healthy
+        run: |
+          for i in $(seq 1 30); do
+            if docker exec ldk-node-bitcoin-1 bitcoin-cli -regtest -rpcuser=user -rpcpassword=pass getblockchaininfo > /dev/null 2>&1; then
+              echo "bitcoind is ready"
+              break
+            fi
+            echo "Waiting for bitcoind... ($i/30)"
+            sleep 2
+          done
+
+      - name: Create Eclair wallet on bitcoind
+        run: |
+          docker exec ldk-node-bitcoin-1 bitcoin-cli -regtest -rpcuser=user -rpcpassword=pass createwallet eclair || true
+
+      - name: Start Eclair
+        run: docker compose --profile eclair up -d
+
+      - name: Wait for Eclair to be ready
+        run: |
+          for i in $(seq 1 60); do
+            if curl -s -u :eclairpassword http://127.0.0.1:8080/getinfo > /dev/null 2>&1; then
+              echo "Eclair is ready"
+              break
+            fi
+            echo "Waiting for Eclair... ($i/60)"
+            sleep 5
+          done
+          curl -s -u :eclairpassword http://127.0.0.1:8080/getinfo || { echo "Eclair failed to start"; docker logs ldk-node-eclair-1; exit 1; }
+
+      - name: Run Eclair integration tests
+        run: RUSTFLAGS="--cfg eclair_test" cargo test --test integration_tests_eclair -- --test-threads=1

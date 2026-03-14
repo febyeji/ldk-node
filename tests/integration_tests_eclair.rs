@@ -23,8 +23,13 @@ use common::external_node::ExternalNode;
 use common::scenarios::*;
 
 fn setup_clients() -> (BitcoindClient, ElectrumClient, TestEclairNode) {
+	// Use wallet-specific RPC URL to avoid multi-wallet conflicts.
+	// Eclair loads its own "eclair" wallet on bitcoind, and our tests
+	// create "ldk_node_test". With two wallets loaded, plain RPC calls
+	// fail with "Wallet file not specified". Using the wallet URL
+	// ensures our calls go to the right wallet.
 	let bitcoind = BitcoindClient::new_with_auth(
-		"http://127.0.0.1:18443",
+		"http://127.0.0.1:18443/wallet/ldk_node_test",
 		Auth::UserPass("user".to_string(), "pass".to_string()),
 	)
 	.unwrap();

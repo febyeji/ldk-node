@@ -1,5 +1,3 @@
-version: '3'
-
 services:
   bitcoin:
     image: blockstream/bitcoind:27.2
@@ -14,11 +12,15 @@ services:
         "-rpcuser=user",
         "-rpcpassword=pass",
         "-fallbackfee=0.00001",
-        "-rest"
+        "-rest",
+        "-zmqpubrawblock=tcp://0.0.0.0:28332",
+        "-zmqpubrawtx=tcp://0.0.0.0:28333"
       ]
     ports:
       - "18443:18443"  # Regtest REST and RPC port
       - "18444:18444"  # Regtest P2P port
+      - "28332:28332"  # ZMQ block port
+      - "28333:28333"  # ZMQ tx port
     networks:
       - bitcoin-electrs
     healthcheck:
@@ -41,10 +43,81 @@ services:
         "--cookie=user:pass",
         "--network=regtest",
         "--daemon-rpc-addr=bitcoin:18443",
-        "--http-addr=0.0.0.0:3002"
+        "--http-addr=0.0.0.0:3002",
+        "--electrum-rpc-addr=0.0.0.0:50001"
       ]
     ports:
       - "3002:3002"
+      - "50001:50001"
+    networks:
+      - bitcoin-electrs
+
+  cln:
+    image: blockstream/lightningd:v23.08
+    platform: linux/amd64
+    profiles: ["cln"]
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+    command:
+      [
+        "--bitcoin-rpcconnect=bitcoin",
+        "--bitcoin-rpcport=18443",
+        "--bitcoin-rpcuser=user",
+        "--bitcoin-rpcpassword=pass",
+        "--regtest",
+        "--experimental-anchors",
+      ]
+    ports:
+      - "19846:19846"
+      - "9937:9937"
+    networks:
+      - bitcoin-electrs
+
+  lnd:
+    image: lightninglabs/lnd:v0.18.5-beta
+    container_name: ldk-node-lnd
+    profiles: ["lnd"]
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+    volumes:
+      - ${LND_DATA_DIR:-/tmp/lnd-data}:/root/.lnd
+    ports:
+      - "8081:8081"
+      - "9735:9735"
+    command:
+      - "--noseedbackup"
+      - "--trickledelay=5000"
+      - "--alias=ldk-node-lnd-test"
+      - "--externalip=lnd:9735"
+      - "--bitcoin.active"
+      - "--bitcoin.regtest"
+      - "--bitcoin.node=bitcoind"
+      - "--bitcoind.rpchost=bitcoin:18443"
+      - "--bitcoind.rpcuser=user"
+      - "--bitcoind.rpcpass=pass"
+      - "--bitcoind.zmqpubrawblock=tcp://bitcoin:28332"
+      - "--bitcoind.zmqpubrawtx=tcp://bitcoin:28333"
+      - "--accept-keysend"
+      - "--rpclisten=0.0.0.0:8081"
+      - "--tlsextradomain=lnd"
+      - "--tlsextraip=0.0.0.0"
+    networks:
+      - bitcoin-electrs
+
+  eclair:
+    image: acinq/eclair:release-0.8.0
+    platform: linux/amd64
+    profiles: ["eclair"]
+    depends_on:
+      bitcoin:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+      - "9736:9736"
+    environment:
+      - JAVA_OPTS=-Declair.chain=regtest -Declair.server.port=9736 -Declair.api.enabled=true -Declair.api.binding-ip=0.0.0.0 -Declair.api.port=8080 -Declair.api.password=eclairpassword -Declair.bitcoind.host=bitcoin -Declair.bitcoind.rpcuser=user -Declair.bitcoind.rpcpassword=pass -Declair.bitcoind.rpcport=18443 -Declair.bitcoind.wallet=eclair -Declair.bitcoind.zmqblock=tcp://bitcoin:28332 -Declair.bitcoind.zmqtx=tcp://bitcoin:28333
     networks:
       - bitcoin-electrs
 
