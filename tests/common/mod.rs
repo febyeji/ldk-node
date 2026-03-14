@@ -5,11 +5,18 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-#![cfg(any(test, cln_test, lnd_test, vss_test))]
+#![cfg(any(test, cln_test, lnd_test, vss_test, eclair_test))]
 #![allow(dead_code)]
 
 pub(crate) mod external_node;
 pub(crate) mod logging;
+
+#[cfg(cln_test)]
+pub(crate) mod cln;
+#[cfg(eclair_test)]
+pub(crate) mod eclair;
+#[cfg(lnd_test)]
+pub(crate) mod lnd;
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -599,6 +606,27 @@ where
 				delay = delay.mul_f32(2.0);
 			},
 
+			None => {},
+		}
+		assert!(tries < 20, "Reached max tries.");
+		tries += 1;
+		tokio::time::sleep(delay).await;
+	}
+}
+
+pub(crate) async fn async_exponential_backoff_poll<T, F, Fut>(mut poll: F) -> T
+where
+	F: FnMut() -> Fut,
+	Fut: Future<Output = Option<T>>,
+{
+	let mut delay = Duration::from_millis(64);
+	let mut tries = 0;
+	loop {
+		match poll().await {
+			Some(data) => break data,
+			None if delay.as_millis() < 512 => {
+				delay = delay.mul_f32(2.0);
+			},
 			None => {},
 		}
 		assert!(tries < 20, "Reached max tries.");
