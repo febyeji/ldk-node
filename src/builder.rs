@@ -1464,6 +1464,10 @@ fn build_with_store_internal(
 				Arc::clone(&logger),
 				Arc::clone(&node_metrics),
 			)
+			.map_err(|e| {
+				log_error!(logger, "Failed to initialize CBF chain source: {}", e);
+				BuildError::ChainSourceSetupFailed
+			})?
 		},
 
 		None => {
