@@ -5,6 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Deref;
 use std::str::FromStr;
@@ -122,22 +123,80 @@ impl Wallet {
 		self.inner.lock().unwrap().start_sync_with_revealed_spks().build()
 	}
 
+	/// Collect scripts for CBF scanning, covering revealed scripts plus a
+	/// lookahead window of `stop_gap` addresses beyond the last revealed index
+	/// for each keychain. This ensures gap-limit scanning works correctly
+	/// during wallet recovery: if activity is found near the boundary, the
+	/// caller can extend the window and rescan.
 	pub(crate) fn get_spks_for_cbf_sync(&self, stop_gap: usize) -> Vec<ScriptBuf> {
 		let wallet = self.inner.lock().unwrap();
-		let mut scripts: Vec<ScriptBuf> =
-			wallet.spk_index().revealed_spks(..).map(|((_, _), spk)| spk).collect();
+		let mut scripts = Vec::new();
 
-		// For first sync when no scripts have been revealed yet, generate
-		// lookahead scripts up to the stop gap for both keychains.
-		if scripts.is_empty() {
-			for keychain in [KeychainKind::External, KeychainKind::Internal] {
-				for idx in 0..stop_gap as u32 {
-					scripts.push(wallet.peek_address(keychain, idx).address.script_pubkey());
+		for keychain in [KeychainKind::External, KeychainKind::Internal] {
+			// Collect already-revealed scripts.
+			for ((kc, _idx), spk) in wallet.spk_index().revealed_spks(..) {
+				if kc == keychain {
+					scripts.push(spk);
 				}
+			}
+
+			// Add lookahead scripts beyond the last revealed index (or from 0
+			// if nothing has been revealed yet) up to stop_gap addresses.
+			let start =
+				wallet.spk_index().last_revealed_index(keychain).map(|idx| idx + 1).unwrap_or(0);
+			for idx in start..start + stop_gap as u32 {
+				scripts.push(wallet.peek_address(keychain, idx).address.script_pubkey());
 			}
 		}
 
 		scripts
+	}
+
+	/// Determine the highest derivation index per keychain that received
+	/// funds in the given transactions. Returns a map suitable for use as
+	/// `last_active_indices` in a BDK `Update`.
+	pub(crate) fn compute_last_active_indices(
+		&self, txs: &[Arc<Transaction>],
+	) -> BTreeMap<KeychainKind, u32> {
+		let wallet = self.inner.lock().unwrap();
+		let spk_index = wallet.spk_index();
+		let mut last_active: BTreeMap<KeychainKind, u32> = BTreeMap::new();
+
+		for tx in txs {
+			for output in &tx.output {
+				if let Some((keychain, idx)) = spk_index.index_of_spk(output.script_pubkey.clone())
+				{
+					let entry = last_active.entry(*keychain).or_insert(0);
+					if *idx > *entry {
+						*entry = *idx;
+					}
+				}
+			}
+		}
+
+		last_active
+	}
+
+	/// Check whether any keychain's last active index is within `stop_gap`
+	/// of the current lookahead boundary, indicating that more addresses
+	/// need to be scanned (gap-limit extension).
+	pub(crate) fn needs_gap_limit_extension(
+		&self, last_active_indices: &BTreeMap<KeychainKind, u32>, stop_gap: usize,
+	) -> bool {
+		let wallet = self.inner.lock().unwrap();
+		let spk_index = wallet.spk_index();
+
+		for (keychain, last_active_idx) in last_active_indices {
+			let last_revealed = spk_index.last_revealed_index(*keychain).unwrap_or(0);
+			let lookahead_end = last_revealed + stop_gap as u32;
+			// If the last active index is within stop_gap of the lookahead end,
+			// there might be more active addresses beyond the current window.
+			if *last_active_idx + stop_gap as u32 >= lookahead_end {
+				return true;
+			}
+		}
+
+		false
 	}
 
 	pub(crate) fn latest_checkpoint(&self) -> bdk_chain::CheckPoint {

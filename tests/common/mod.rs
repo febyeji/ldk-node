@@ -500,15 +500,16 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 			let p2p_socket = bitcoind.params.p2p_socket.expect("P2P must be enabled for CBF");
 			let peer_addr = format!("{}", p2p_socket);
 			let timeouts_config = SyncTimeoutsConfig {
-				onchain_wallet_sync_timeout_secs: 3,
-				lightning_wallet_sync_timeout_secs: 3,
-				fee_rate_cache_update_timeout_secs: 3,
-				tx_broadcast_timeout_secs: 3,
-				per_request_timeout_secs: 3,
+				onchain_wallet_sync_timeout_secs: 30,
+				lightning_wallet_sync_timeout_secs: 30,
+				fee_rate_cache_update_timeout_secs: 10,
+				tx_broadcast_timeout_secs: 5,
+				per_request_timeout_secs: 10,
 			};
 			let sync_config = CbfSyncConfig {
 				background_sync_config: None,
 				timeouts_config,
+				required_peers: 1,
 				..Default::default()
 			};
 			builder.set_chain_source_cbf(vec![peer_addr], Some(sync_config), None);
@@ -548,7 +549,9 @@ pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> 
 	node.start().unwrap();
 	assert!(node.status().is_running);
 
-	if !matches!(chain_source, TestChainSource::Cbf(_)) {
+	if matches!(chain_source, TestChainSource::Cbf(_)) {
+		wait_for_cbf_initial_sync(&node);
+	} else {
 		assert!(node.status().latest_fee_rate_cache_update_timestamp.is_some());
 	}
 	node
@@ -638,6 +641,24 @@ pub(crate) async fn wait_for_outpoint_spend<E: ElectrumApi>(electrs: &E, outpoin
 		is_spent.then_some(())
 	})
 	.await;
+}
+
+/// Blocking wait for CBF initial sync (headers + filters). Used in `setup_node`
+/// where we cannot `.await`. Same backoff strategy as the async version below.
+pub(crate) fn wait_for_cbf_initial_sync(node: &TestNode) {
+	let mut delay = Duration::from_millis(200);
+	for _ in 0..30 {
+		if node.sync_wallets().is_ok()
+			&& node.status().latest_onchain_wallet_sync_timestamp.is_some()
+		{
+			return;
+		}
+		std::thread::sleep(delay);
+		if delay < Duration::from_secs(2) {
+			delay = delay.mul_f32(1.5);
+		}
+	}
+	panic!("wait_for_cbf_initial_sync: timed out waiting for CBF initial sync");
 }
 
 pub(crate) async fn wait_for_cbf_sync(node: &TestNode) {

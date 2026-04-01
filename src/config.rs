@@ -516,6 +516,19 @@ pub struct CbfSyncConfig {
 	///
 	/// Defaults to 2.
 	pub required_peers: u8,
+	/// Maximum number of retry attempts for a single filter scan before giving up.
+	///
+	/// Each retry uses exponential backoff starting from `initial_backoff_ms`.
+	/// Set to 0 to disable retries.
+	///
+	/// Defaults to 3.
+	pub max_scan_retries: u8,
+	/// Initial backoff duration in milliseconds before the first retry.
+	///
+	/// Doubled on each subsequent retry, capped at 30 seconds.
+	///
+	/// Defaults to 500ms.
+	pub initial_backoff_ms: u64,
 }
 
 impl Default for CbfSyncConfig {
@@ -525,6 +538,8 @@ impl Default for CbfSyncConfig {
 			timeouts_config: SyncTimeoutsConfig::default(),
 			response_timeout_secs: 30,
 			required_peers: 2,
+			max_scan_retries: 3,
+			initial_backoff_ms: 500,
 		}
 	}
 }

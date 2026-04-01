@@ -15,7 +15,8 @@ use bdk_chain::{BlockId, ConfirmationBlockTime, TxUpdate};
 use bdk_wallet::Update;
 use bip157::chain::BlockHeaderChanges;
 use bip157::{
-	BlockHash, Builder, Client, Event, Info, Requester, SyncUpdate, TrustedPeer, Warning,
+	BlockHash, Builder, Client, Event, IndexedBlock, Info, Requester, SyncUpdate, TrustedPeer,
+	Warning,
 };
 use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
 use bitcoin::{Amount, FeeRate, Network, Script, ScriptBuf, Transaction, Txid};
@@ -43,6 +44,11 @@ const MIN_FEERATE_SAT_PER_KWU: u64 = 250;
 /// Number of recent blocks to look back for per-target fee rate estimation.
 const FEE_RATE_LOOKBACK_BLOCKS: usize = 6;
 
+/// Number of blocks to walk back from a component's persisted best block height
+/// for reorg safety when computing the incremental scan skip height.
+/// Matches bdk-kyoto's `IMPOSSIBLE_REORG_DEPTH`.
+const REORG_SAFETY_BLOCKS: u32 = 7;
+
 /// The fee estimation back-end used by the CBF chain source.
 enum FeeSource {
 	/// Derive fee rates from the coinbase reward of recent blocks.
@@ -67,7 +73,9 @@ pub(super) struct CbfChainSource {
 	/// Fee estimation back-end.
 	fee_source: FeeSource,
 	/// Tracks whether the bip157 node is running and holds the command handle.
-	cbf_runtime_status: Mutex<CbfRuntimeStatus>,
+	cbf_runtime_status: Arc<Mutex<CbfRuntimeStatus>>,
+	/// Signals the auto-restart loop to stop.
+	stop_flag: Arc<AtomicBool>,
 	/// Latest chain tip hash, updated by the background event processing task.
 	latest_tip: Arc<Mutex<Option<BlockHash>>>,
 	/// Scripts to match against compact block filters during a scan.
@@ -82,12 +90,6 @@ pub(super) struct CbfChainSource {
 	scan_lock: tokio::sync::Mutex<()>,
 	/// Scripts registered by LDK's Filter trait for lightning channel monitoring.
 	registered_scripts: Mutex<Vec<ScriptBuf>>,
-	/// Set when new scripts are registered; forces a full rescan on next lightning sync.
-	lightning_scripts_dirty: Arc<AtomicBool>,
-	/// Last block height reached by on-chain wallet sync, used for incremental scans.
-	last_onchain_synced_height: Arc<Mutex<Option<u32>>>,
-	/// Last block height reached by lightning wallet sync, used for incremental scans.
-	last_lightning_synced_height: Arc<Mutex<Option<u32>>>,
 	/// Deduplicates concurrent on-chain wallet sync requests.
 	onchain_wallet_sync_status: Mutex<WalletSyncStatus>,
 	/// Deduplicates concurrent lightning wallet sync requests.
@@ -116,9 +118,6 @@ struct CbfEventState {
 	matched_block_hashes: Arc<Mutex<Vec<(u32, BlockHash)>>>,
 	sync_completion_tx: Arc<Mutex<Option<oneshot::Sender<SyncUpdate>>>>,
 	filter_skip_height: Arc<AtomicU32>,
-	last_onchain_synced_height: Arc<Mutex<Option<u32>>>,
-	last_lightning_synced_height: Arc<Mutex<Option<u32>>>,
-	lightning_scripts_dirty: Arc<AtomicBool>,
 }
 
 impl CbfChainSource {
@@ -142,17 +141,15 @@ impl CbfChainSource {
 			None => FeeSource::Cbf,
 		};
 
-		let cbf_runtime_status = Mutex::new(CbfRuntimeStatus::Stopped);
+		let cbf_runtime_status = Arc::new(Mutex::new(CbfRuntimeStatus::Stopped));
+		let stop_flag = Arc::new(AtomicBool::new(false));
 		let latest_tip = Arc::new(Mutex::new(None));
 		let watched_scripts = Arc::new(RwLock::new(Vec::new()));
 		let matched_block_hashes = Arc::new(Mutex::new(Vec::new()));
 		let sync_completion_tx = Arc::new(Mutex::new(None));
 		let filter_skip_height = Arc::new(AtomicU32::new(0));
 		let registered_scripts = Mutex::new(Vec::new());
-		let lightning_scripts_dirty = Arc::new(AtomicBool::new(true));
 		let scan_lock = tokio::sync::Mutex::new(());
-		let last_onchain_synced_height = Arc::new(Mutex::new(None));
-		let last_lightning_synced_height = Arc::new(Mutex::new(None));
 		let onchain_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
 		let lightning_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
 		Ok(Self {
@@ -160,16 +157,14 @@ impl CbfChainSource {
 			sync_config,
 			fee_source,
 			cbf_runtime_status,
+			stop_flag,
 			latest_tip,
 			watched_scripts,
 			matched_block_hashes,
 			sync_completion_tx,
 			filter_skip_height,
 			registered_scripts,
-			lightning_scripts_dirty,
 			scan_lock,
-			last_onchain_synced_height,
-			last_lightning_synced_height,
 			onchain_wallet_sync_status,
 			lightning_wallet_sync_status,
 			fee_estimator,
@@ -180,7 +175,35 @@ impl CbfChainSource {
 		})
 	}
 
+	/// Build a fresh bip157 `(Node, Client)` pair from the current configuration.
+	fn build_cbf_node(
+		network: Network, data_dir: &std::path::Path, peers: &[String], required_peers: u8,
+		response_timeout_secs: u64,
+	) -> (bip157::Node, Client) {
+		let mut builder = Builder::new(network);
+		builder = builder.data_dir(data_dir.to_path_buf());
+
+		let trusted_peers: Vec<TrustedPeer> = peers
+			.iter()
+			.filter_map(|peer_str| {
+				peer_str.parse::<SocketAddr>().ok().map(TrustedPeer::from_socket_addr)
+			})
+			.collect();
+		if !trusted_peers.is_empty() {
+			builder = builder.add_peers(trusted_peers);
+		}
+		builder = builder.required_peers(required_peers);
+		builder = builder.fetch_witness_data();
+		builder = builder.response_timeout(Duration::from_secs(response_timeout_secs));
+
+		builder.build()
+	}
+
 	/// Start the bip157 node and spawn background tasks for event processing.
+	///
+	/// The node automatically restarts with exponential backoff if it exits
+	/// unexpectedly (e.g. due to `NoReachablePeers`). A graceful shutdown
+	/// via [`stop()`](Self::stop) will not trigger a restart.
 	pub(crate) fn start(&self, runtime: Arc<Runtime>) {
 		let mut status = self.cbf_runtime_status.lock().unwrap();
 		if matches!(*status, CbfRuntimeStatus::Started { .. }) {
@@ -188,70 +211,31 @@ impl CbfChainSource {
 			return;
 		}
 
+		self.stop_flag.store(false, Ordering::Release);
+
 		let network = self.config.network;
-
-		let mut builder = Builder::new(network);
-
-		// Configure data directory under the node's storage path.
 		let data_dir = std::path::PathBuf::from(&self.config.storage_dir_path).join("bip157_data");
-		builder = builder.data_dir(data_dir);
+		let peers = self.peers.clone();
+		let required_peers = self.sync_config.required_peers;
+		let response_timeout_secs = self.sync_config.response_timeout_secs;
 
-		// Add configured peers.
-		let peers: Vec<TrustedPeer> = self
-			.peers
-			.iter()
-			.filter_map(|peer_str| {
-				peer_str.parse::<SocketAddr>().ok().map(TrustedPeer::from_socket_addr)
-			})
-			.collect();
-		if !peers.is_empty() {
-			builder = builder.add_peers(peers);
-		}
-
-		// Require multiple peers to agree on filter headers before accepting them,
-		// as recommended by BIP 157 to mitigate malicious peer attacks.
-		builder = builder.required_peers(self.sync_config.required_peers);
-
-		// Request witness data so segwit transactions include full witnesses,
-		// required for Lightning channel operations.
-		builder = builder.fetch_witness_data();
-
-		// Set peer response timeout from user configuration (default: 30s).
-		builder =
-			builder.response_timeout(Duration::from_secs(self.sync_config.response_timeout_secs));
-
-		let (node, client) = builder.build();
-
+		let (node, client) =
+			Self::build_cbf_node(network, &data_dir, &peers, required_peers, response_timeout_secs);
 		let Client { requester, info_rx, warn_rx, event_rx } = client;
 
-		// Spawn the bip157 node in the background.
-		let node_logger = Arc::clone(&self.logger);
-		runtime.spawn_background_task(async move {
-			if let Err(e) = node.run().await {
-				log_error!(node_logger, "CBF node exited with error: {:?}", e);
-			}
-		});
-
-		// Spawn a task to log info messages.
+		// Spawn initial event processing tasks.
 		let info_logger = Arc::clone(&self.logger);
 		runtime
 			.spawn_cancellable_background_task(Self::process_info_messages(info_rx, info_logger));
-
-		// Spawn a task to log warning messages.
 		let warn_logger = Arc::clone(&self.logger);
 		runtime
 			.spawn_cancellable_background_task(Self::process_warn_messages(warn_rx, warn_logger));
-
-		// Spawn a task to process events.
 		let event_state = CbfEventState {
 			latest_tip: Arc::clone(&self.latest_tip),
 			watched_scripts: Arc::clone(&self.watched_scripts),
 			matched_block_hashes: Arc::clone(&self.matched_block_hashes),
 			sync_completion_tx: Arc::clone(&self.sync_completion_tx),
 			filter_skip_height: Arc::clone(&self.filter_skip_height),
-			last_onchain_synced_height: Arc::clone(&self.last_onchain_synced_height),
-			last_lightning_synced_height: Arc::clone(&self.last_lightning_synced_height),
-			lightning_scripts_dirty: Arc::clone(&self.lightning_scripts_dirty),
 		};
 		let event_logger = Arc::clone(&self.logger);
 		runtime.spawn_cancellable_background_task(Self::process_events(
@@ -261,13 +245,100 @@ impl CbfChainSource {
 		));
 
 		log_info!(self.logger, "CBF chain source started.");
-
 		*status = CbfRuntimeStatus::Started { requester };
+		drop(status);
+
+		// Spawn a background task that runs the node and auto-restarts on
+		// unexpected exit (e.g. NoReachablePeers) with exponential backoff.
+		let cbf_status = Arc::clone(&self.cbf_runtime_status);
+		let stop_flag = Arc::clone(&self.stop_flag);
+		let logger = Arc::clone(&self.logger);
+		let latest_tip = Arc::clone(&self.latest_tip);
+		let watched_scripts = Arc::clone(&self.watched_scripts);
+		let matched_block_hashes = Arc::clone(&self.matched_block_hashes);
+		let sync_completion_tx = Arc::clone(&self.sync_completion_tx);
+		let filter_skip_height = Arc::clone(&self.filter_skip_height);
+
+		runtime.spawn_background_task(async move {
+			// Run the initial node instance.
+			let initial_result = node.run().await;
+
+			if let Err(ref e) = initial_result {
+				log_error!(logger, "CBF node exited with error: {:?}", e);
+			}
+
+			// Graceful shutdown or stop requested — don't restart.
+			if initial_result.is_ok() || stop_flag.load(Ordering::Acquire) {
+				return;
+			}
+
+			// Auto-restart loop with exponential backoff.
+			let mut backoff = Duration::from_secs(1);
+			let max_backoff = Duration::from_secs(30);
+
+			loop {
+				log_info!(logger, "Restarting CBF node in {}ms...", backoff.as_millis());
+				tokio::time::sleep(backoff).await;
+
+				if stop_flag.load(Ordering::Acquire) {
+					break;
+				}
+
+				let (new_node, new_client) = Self::build_cbf_node(
+					network,
+					&data_dir,
+					&peers,
+					required_peers,
+					response_timeout_secs,
+				);
+				let Client { requester, info_rx, warn_rx, event_rx } = new_client;
+
+				// Update the shared requester under the status lock, checking
+				// the stop flag atomically to avoid racing with stop().
+				{
+					let mut s = cbf_status.lock().unwrap();
+					if stop_flag.load(Ordering::Acquire) {
+						let _ = requester.shutdown();
+						break;
+					}
+					*s = CbfRuntimeStatus::Started { requester };
+				}
+
+				// Spawn event processors as detached tasks — they will exit
+				// naturally when the node's channels close.
+				let event_state = CbfEventState {
+					latest_tip: Arc::clone(&latest_tip),
+					watched_scripts: Arc::clone(&watched_scripts),
+					matched_block_hashes: Arc::clone(&matched_block_hashes),
+					sync_completion_tx: Arc::clone(&sync_completion_tx),
+					filter_skip_height: Arc::clone(&filter_skip_height),
+				};
+				tokio::spawn(Self::process_info_messages(info_rx, Arc::clone(&logger)));
+				tokio::spawn(Self::process_warn_messages(warn_rx, Arc::clone(&logger)));
+				tokio::spawn(Self::process_events(event_rx, event_state, Arc::clone(&logger)));
+
+				log_info!(logger, "CBF chain source restarted.");
+
+				match new_node.run().await {
+					Ok(()) => break,
+					Err(e) => {
+						log_error!(logger, "CBF node exited with error: {:?}", e);
+						if stop_flag.load(Ordering::Acquire) {
+							break;
+						}
+						backoff = std::cmp::min(backoff * 2, max_backoff);
+					},
+				}
+			}
+		});
 	}
 
 	/// Shut down the bip157 node and stop all background tasks.
 	pub(crate) fn stop(&self) {
 		let mut status = self.cbf_runtime_status.lock().unwrap();
+		// Set the stop flag under the status lock so the restart loop
+		// cannot race between checking the flag and updating the requester.
+		self.stop_flag.store(true, Ordering::Release);
 		match &*status {
 			CbfRuntimeStatus::Started { requester } => {
 				let _ = requester.shutdown();
@@ -320,24 +391,9 @@ impl CbfChainSource {
 							accepted.len(),
 						);
 
-						// Reset synced heights to just before the earliest reorganized
-						// block so the next incremental scan covers the affected range.
-						if let Some(min_reorg_height) = reorganized.iter().map(|h| h.height).min() {
-							let reset_height = if min_reorg_height > 0 {
-								Some(min_reorg_height - 1)
-							} else {
-								None
-							};
-							*state.last_onchain_synced_height.lock().unwrap() = reset_height;
-							*state.last_lightning_synced_height.lock().unwrap() = reset_height;
-							state.lightning_scripts_dirty.store(true, Ordering::Release);
-							log_debug!(
-								logger,
-								"Reset synced heights to {:?} due to reorg at height {}.",
-								reset_height,
-								min_reorg_height,
-							);
-						}
+						// No height reset needed: skip heights are derived from
+						// BDK's checkpoint (on-chain) and LDK's best block
+						// (lightning), both walked back by REORG_SAFETY_BLOCKS.
 					},
 					BlockHeaderChanges::Connected(header) => {
 						log_trace!(logger, "CBF block connected at height {}", header.height,);
@@ -382,13 +438,21 @@ impl CbfChainSource {
 	/// Register a transaction script for Lightning channel monitoring.
 	pub(crate) fn register_tx(&self, _txid: &Txid, script_pubkey: &Script) {
 		self.registered_scripts.lock().unwrap().push(script_pubkey.to_owned());
-		self.lightning_scripts_dirty.store(true, Ordering::Release);
 	}
 
 	/// Register a watched output script for Lightning channel monitoring.
 	pub(crate) fn register_output(&self, output: WatchedOutput) {
 		self.registered_scripts.lock().unwrap().push(output.script_pubkey.clone());
-		self.lightning_scripts_dirty.store(true, Ordering::Release);
+	}
+
+	/// Reset scan-related shared state. Called after every scan attempt
+	/// (success or failure) to leave a clean slate for the next scan.
+	fn cleanup_scan_state(&self) {
+		self.filter_skip_height.store(0, Ordering::Release);
+		self.watched_scripts.write().unwrap().clear();
+		self.matched_block_hashes.lock().unwrap().clear();
+		// Drop any pending completion sender so the channel doesn't leak.
+		let _ = self.sync_completion_tx.lock().unwrap().take();
 	}
 
 	/// Run a CBF filter scan: set watched scripts, trigger a rescan, wait for
@@ -412,11 +476,13 @@ impl CbfChainSource {
 
 		requester.rescan().map_err(|e| {
 			log_error!(self.logger, "Failed to trigger CBF rescan: {:?}", e);
+			self.cleanup_scan_state();
 			Error::WalletOperationFailed
 		})?;
 
 		let sync_update = rx.await.map_err(|e| {
 			log_error!(self.logger, "CBF sync completion channel dropped: {:?}", e);
+			self.cleanup_scan_state();
 			Error::WalletOperationFailed
 		})?;
 
@@ -425,6 +491,93 @@ impl CbfChainSource {
 		let matched = std::mem::take(&mut *self.matched_block_hashes.lock().unwrap());
 
 		Ok((sync_update, matched))
+	}
+
+	/// Run a filter scan with exponential backoff retry on failure.
+	///
+	/// On each failure, shared scan state is cleaned up by `run_filter_scan`
+	/// before this method retries, ensuring each attempt starts fresh.
+	async fn run_filter_scan_with_retry(
+		&self, scripts: Vec<ScriptBuf>, skip_before_height: Option<u32>,
+	) -> Result<(SyncUpdate, Vec<(u32, BlockHash)>), Error> {
+		let max_retries = self.sync_config.max_scan_retries;
+		let initial_backoff = Duration::from_millis(self.sync_config.initial_backoff_ms);
+		let max_backoff = Duration::from_secs(30);
+		let mut backoff = initial_backoff;
+
+		for attempt in 0..=max_retries {
+			match self.run_filter_scan(scripts.clone(), skip_before_height).await {
+				Ok(result) => return Ok(result),
+				Err(e) => {
+					if attempt == max_retries {
+						log_error!(
+							self.logger,
+							"CBF filter scan failed after {} attempts: {:?}",
+							max_retries + 1,
+							e,
+						);
+						return Err(e);
+					}
+
+					log_debug!(
+						self.logger,
+						"CBF filter scan attempt {}/{} failed: {:?}. Retrying in {}ms.",
+						attempt + 1,
+						max_retries + 1,
+						e,
+						backoff.as_millis(),
+					);
+
+					tokio::time::sleep(backoff).await;
+					backoff = std::cmp::min(backoff * 2, max_backoff);
+				},
+			}
+		}
+
+		unreachable!()
+	}
+
+	/// Fetch a block by hash with retry and exponential backoff.
+	async fn fetch_block_with_retry(
+		&self, requester: &Requester, block_hash: BlockHash,
+	) -> Result<IndexedBlock, Error> {
+		let max_retries = self.sync_config.max_scan_retries;
+		let initial_backoff = Duration::from_millis(self.sync_config.initial_backoff_ms);
+		let max_backoff = Duration::from_secs(30);
+		let mut backoff = initial_backoff;
+
+		for attempt in 0..=max_retries {
+			match requester.get_block(block_hash).await {
+				Ok(block) => return Ok(block),
+				Err(e) => {
+					if attempt == max_retries {
+						log_error!(
+							self.logger,
+							"Failed to fetch block {} after {} attempts: {:?}",
+							block_hash,
+							max_retries + 1,
+							e,
+						);
+						return Err(Error::WalletOperationFailed);
+					}
+
+					log_debug!(
+						self.logger,
+						"Block fetch attempt {}/{} for {} failed: {:?}. Retrying in {}ms.",
+						attempt + 1,
+						max_retries + 1,
+						block_hash,
+						e,
+						backoff.as_millis(),
+					);
+
+					tokio::time::sleep(backoff).await;
+					backoff = std::cmp::min(backoff * 2, max_backoff);
+				},
+			}
+		}
+
+		unreachable!()
 	}
 
 	/// Sync the on-chain wallet by scanning compact block filters for relevant transactions.
@@ -448,25 +601,115 @@ impl CbfChainSource {
 			let requester = self.requester()?;
 			let now = Instant::now();
 
-			let scripts = onchain_wallet.get_spks_for_cbf_sync(BDK_CLIENT_STOP_GAP);
-			if scripts.is_empty() {
-				log_debug!(self.logger, "No wallet scripts to sync via CBF.");
-				return Ok(());
+			let mut all_tx_update = TxUpdate::default();
+			let mut last_sync_update: Option<SyncUpdate>;
+			let mut combined_last_active = BTreeMap::new();
+
+			// Iterative gap-limit scanning: keep scanning as long as we find
+			// activity near the boundary of our lookahead window, extending
+			// it each round so we don't miss addresses beyond the initial
+			// stop_gap during wallet recovery.
+			loop {
+				let scripts = onchain_wallet.get_spks_for_cbf_sync(BDK_CLIENT_STOP_GAP);
+				if scripts.is_empty() {
+					log_debug!(self.logger, "No wallet scripts to sync via CBF.");
+					return Ok(());
+				}
+
+				let timeout_fut = tokio::time::timeout(
+					Duration::from_secs(
+						self.sync_config.timeouts_config.onchain_wallet_sync_timeout_secs,
+					),
+					self.sync_onchain_wallet_op(requester.clone(), &onchain_wallet, scripts),
+				);
+
+				let (tx_update, sync_update) = match timeout_fut.await {
+					Ok(res) => match res {
+						Ok(data) => data,
+						Err(e) => {
+							// If we already collected data from prior rounds, apply it
+							// before propagating the error so progress is not lost.
+							if !all_tx_update.txs.is_empty() {
+								log_debug!(
+									self.logger,
+									"Applying partial CBF sync progress ({} txs) before error.",
+									all_tx_update.txs.len(),
+								);
+								let cp = onchain_wallet.latest_checkpoint();
+								let partial_update = Update {
+									last_active_indices: combined_last_active.clone(),
+									tx_update: all_tx_update,
+									chain: Some(cp),
+								};
+								let _ = onchain_wallet.apply_update(partial_update);
+							}
+							return Err(e);
+						},
+					},
+					Err(e) => {
+						log_error!(self.logger, "Sync of on-chain wallet timed out: {}", e);
+						// Same partial-progress preservation on timeout.
+						if !all_tx_update.txs.is_empty() {
+							log_debug!(
+								self.logger,
+								"Applying partial CBF sync progress ({} txs) before timeout.",
+								all_tx_update.txs.len(),
+							);
+							let cp = onchain_wallet.latest_checkpoint();
+							let partial_update = Update {
+								last_active_indices: combined_last_active.clone(),
+								tx_update: all_tx_update,
+								chain: Some(cp),
+							};
+							let _ = onchain_wallet.apply_update(partial_update);
+						}
+						return Err(Error::WalletOperationTimeout);
+					},
+				};
+
+				// Determine the highest active derivation index per keychain
+				// from the matched transactions so BDK can advance its index.
+				let round_last_active = onchain_wallet.compute_last_active_indices(&tx_update.txs);
+				for (kc, idx) in &round_last_active {
+					let entry = combined_last_active.entry(*kc).or_insert(0u32);
+					if *idx > *entry {
+						*entry = *idx;
+					}
+				}
+
+				// Merge this round's transactions into the cumulative update.
+				all_tx_update.txs.extend(tx_update.txs);
+				all_tx_update.anchors.extend(tx_update.anchors);
+				last_sync_update = Some(sync_update);
+
+				// If activity was found near the gap boundary, apply what we
+				// have so BDK reveals new addresses, then scan the new window.
+				if !round_last_active.is_empty()
+					&& onchain_wallet
+						.needs_gap_limit_extension(&combined_last_active, BDK_CLIENT_STOP_GAP)
+				{
+					log_debug!(
+						self.logger,
+						"Gap-limit boundary reached, extending lookahead and rescanning.",
+					);
+					// Apply intermediate update to advance BDK's derivation index
+					// so `get_spks_for_cbf_sync` returns the extended window.
+					let intermediate_cp = onchain_wallet.latest_checkpoint();
+					let intermediate_update = Update {
+						last_active_indices: combined_last_active.clone(),
+						tx_update: std::mem::take(&mut all_tx_update),
+						chain: Some(intermediate_cp),
+					};
+					onchain_wallet.apply_update(intermediate_update)?;
+					continue;
+				}
+
+				break;
 			}
 
-			let timeout_fut = tokio::time::timeout(
-				Duration::from_secs(
-					self.sync_config.timeouts_config.onchain_wallet_sync_timeout_secs,
-				),
-				self.sync_onchain_wallet_op(requester, scripts),
-			);
-
-			let (tx_update, sync_update) = match timeout_fut.await {
-				Ok(res) => res?,
-				Err(e) => {
-					log_error!(self.logger, "Sync of on-chain wallet timed out: {}", e);
-					return Err(Error::WalletOperationTimeout);
-				},
+			let sync_update = match last_sync_update {
+				Some(su) => su,
+				None => return Ok(()),
 			};
 
 			// Build chain checkpoint extending from the wallet's current tip.
@@ -483,8 +726,11 @@ impl CbfChainSource {
 				cp = cp.push(tip_block_id).unwrap_or_else(|old| old);
 			}
 
-			let update =
-				Update { last_active_indices: BTreeMap::new(), tx_update, chain: Some(cp) };
+			let update = Update {
+				last_active_indices: combined_last_active,
+				tx_update: all_tx_update,
+				chain: Some(cp),
+			};
 
 			onchain_wallet.apply_update(update)?;
 
@@ -513,12 +759,11 @@ impl CbfChainSource {
 	}
 
 	async fn sync_onchain_wallet_op(
-		&self, requester: Requester, scripts: Vec<ScriptBuf>,
+		&self, requester: Requester, onchain_wallet: &Wallet, scripts: Vec<ScriptBuf>,
 	) -> Result<(TxUpdate<ConfirmationBlockTime>, SyncUpdate), Error> {
-		// Always do a full scan (skip_height=None) for the on-chain wallet.
-		// Unlike the Lightning wallet which can rely on reorg_queue events,
-		// the on-chain wallet needs to see all blocks to correctly detect
-		// reorgs via checkpoint comparison in the caller.
+		// Derive skip height from BDK's persisted checkpoint, walked back by
+		// REORG_SAFETY_BLOCKS for reorg safety (same approach as bdk-kyoto).
+		// This survives restarts since BDK persists its checkpoint chain.
 		//
 		// We include LDK-registered scripts (e.g., channel funding output
 		// scripts) alongside the wallet scripts. This ensures the on-chain
@@ -530,9 +775,11 @@ impl CbfChainSource {
 		// unknown. This mirrors what the Bitcoind chain source does in
 		// `Wallet::block_connected` by inserting registered tx outputs.
 		let mut all_scripts = scripts;
-		// we query all registered scripts, not only BDK-related
 		all_scripts.extend(self.registered_scripts.lock().unwrap().iter().cloned());
-		let (sync_update, matched) = self.run_filter_scan(all_scripts, None).await?;
+		let skip_height =
+			onchain_wallet.latest_checkpoint().height().checked_sub(REORG_SAFETY_BLOCKS);
+		let (sync_update, matched) =
+			self.run_filter_scan_with_retry(all_scripts, skip_height).await?;
 
 		log_debug!(
 			self.logger,
@@ -546,10 +793,7 @@ impl CbfChainSource {
 		// from matched blocks and let BDK determine relevance.
 		let mut tx_update = TxUpdate::default();
 		for (height, block_hash) in &matched {
-			let indexed_block = requester.get_block(*block_hash).await.map_err(|e| {
-				log_error!(self.logger, "Failed to fetch block {}: {:?}", block_hash, e);
-				Error::WalletOperationFailed
-			})?;
+			let indexed_block = self.fetch_block_with_retry(&requester, *block_hash).await?;
 			let block = indexed_block.block;
 			let block_id = BlockId { height: *height, hash: block.header.block_hash() };
 			let conf_time =
@@ -560,9 +804,6 @@ impl CbfChainSource {
 				tx_update.anchors.insert((conf_time, txid));
 			}
 		}
-
-		let tip = sync_update.tip();
-		*self.last_onchain_synced_height.lock().unwrap() = Some(tip.height);
 
 		Ok((tx_update, sync_update))
 	}
@@ -644,10 +885,9 @@ impl CbfChainSource {
 		&self, requester: Requester, channel_manager: Arc<ChannelManager>,
 		chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>, scripts: Vec<ScriptBuf>,
 	) -> Result<(), Error> {
-		let scripts_dirty = self.lightning_scripts_dirty.load(Ordering::Acquire);
 		let skip_height =
-			if scripts_dirty { None } else { *self.last_lightning_synced_height.lock().unwrap() };
-		let (sync_update, matched) = self.run_filter_scan(scripts, skip_height).await?;
+			channel_manager.current_best_block().height.checked_sub(REORG_SAFETY_BLOCKS);
+		let (sync_update, matched) = self.run_filter_scan_with_retry(scripts, skip_height).await?;
 
 		log_debug!(
 			self.logger,
@@ -663,14 +903,15 @@ impl CbfChainSource {
 		// created outputs and spent inputs), so we confirm every transaction
 		// from matched blocks and let LDK determine relevance.
 		for (height, block_hash) in &matched {
-			confirm_block_transactions(
-				&requester,
-				*block_hash,
-				*height,
-				&confirmables,
-				&self.logger,
-			)
-			.await?;
+			let indexed_block = self.fetch_block_with_retry(&requester, *block_hash).await?;
+			let block = &indexed_block.block;
+			let header = &block.header;
+			let txdata: Vec<(usize, &Transaction)> = block.txdata.iter().enumerate().collect();
+			if !txdata.is_empty() {
+				for confirmable in &confirmables {
+					confirmable.transactions_confirmed(header, &txdata, *height);
+				}
+			}
 		}
 
 		// Update the best block tip.
@@ -680,9 +921,6 @@ impl CbfChainSource {
 				confirmable.best_block_updated(tip_header, tip.height);
 			}
 		}
-
-		*self.last_lightning_synced_height.lock().unwrap() = Some(tip.height);
-		self.lightning_scripts_dirty.store(false, Ordering::Release);
 
 		Ok(())
 	}
@@ -1043,26 +1281,6 @@ fn update_node_metrics_timestamp(
 	let mut locked = node_metrics.write().unwrap();
 	setter(&mut locked, unix_time_secs_opt);
 	write_node_metrics(&*locked, kv_store, logger)?;
-	Ok(())
-}
-
-/// Fetch a block by hash and call `transactions_confirmed` on each confirmable.
-async fn confirm_block_transactions(
-	requester: &Requester, block_hash: BlockHash, height: u32,
-	confirmables: &[&(dyn Confirm + Sync + Send)], logger: &Logger,
-) -> Result<(), Error> {
-	let indexed_block = requester.get_block(block_hash).await.map_err(|e| {
-		log_error!(logger, "Failed to fetch block {}: {:?}", block_hash, e);
-		Error::TxSyncFailed
-	})?;
-	let block = &indexed_block.block;
-	let header = &block.header;
-	let txdata: Vec<(usize, &Transaction)> = block.txdata.iter().enumerate().collect();
-	if !txdata.is_empty() {
-		for confirmable in confirmables {
-			confirmable.transactions_confirmed(header, &txdata, height);
-		}
-	}
 	Ok(())
 }
 
