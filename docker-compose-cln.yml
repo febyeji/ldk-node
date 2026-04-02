@@ -48,7 +48,7 @@ services:
       - bitcoin-electrs
 
   cln:
-    image: blockstream/lightningd:v23.08
+    image: elementsproject/lightningd:v25.12.1
     platform: linux/amd64
     depends_on:
       bitcoin:

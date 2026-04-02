@@ -1732,6 +1732,7 @@ impl Node {
 					.close_channel(&channel_details.channel_id, &counterparty_node_id)
 					.map_err(|e| {
 						log_error!(self.logger, "Failed to close channel: {:?}", e);
+						eprintln!("[DEBUG close_channel] APIError: {:?}", e);
 						Error::ChannelClosingFailed
 					})?;
 			}
