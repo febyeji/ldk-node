@@ -344,6 +344,7 @@ impl CbfChainSource {
 								retries,
 								e,
 							);
+							*restart_status.lock().unwrap() = CbfRuntimeStatus::Stopped;
 							break;
 						}
 						log_error!(
@@ -503,8 +504,8 @@ impl CbfChainSource {
 
 	/// Reset filter scan state to a clean baseline.
 	///
-	/// Called on both success and error paths in `run_filter_scan()` to ensure
-	/// no stale state leaks between scans.
+	/// Called on error paths in `run_filter_scan()` to ensure no stale state
+	/// leaks between scans. The success path performs inline cleanup instead.
 	fn cleanup_scan_state(&self) {
 		self.filter_skip_height.store(0, Ordering::Release);
 		self.watched_scripts.write().unwrap().clear();
@@ -684,11 +685,20 @@ impl CbfChainSource {
 		// created outputs and spent inputs), so we include every transaction
 		// from matched blocks and let BDK determine relevance.
 		let mut tx_update = TxUpdate::default();
+		let per_request_timeout =
+			Duration::from_secs(self.sync_config.timeouts_config.per_request_timeout_secs.into());
 		for (height, block_hash) in &matched {
-			let indexed_block = requester.get_block(*block_hash).await.map_err(|e| {
-				log_error!(self.logger, "Failed to fetch block {}: {:?}", block_hash, e);
-				Error::WalletOperationFailed
-			})?;
+			let indexed_block =
+				tokio::time::timeout(per_request_timeout, requester.get_block(*block_hash))
+					.await
+					.map_err(|_| {
+						log_error!(self.logger, "Timed out fetching block {}", block_hash);
+						Error::WalletOperationFailed
+					})?
+					.map_err(|e| {
+						log_error!(self.logger, "Failed to fetch block {}: {:?}", block_hash, e);
+						Error::WalletOperationFailed
+					})?;
 			let block = indexed_block.block;
 			let block_id = BlockId { height: *height, hash: block.header.block_hash() };
 			let conf_time =
@@ -797,12 +807,15 @@ impl CbfChainSource {
 		// The compact block filter already matched our scripts (covering both
 		// created outputs and spent inputs), so we confirm every transaction
 		// from matched blocks and let LDK determine relevance.
+		let per_request_timeout =
+			Duration::from_secs(self.sync_config.timeouts_config.per_request_timeout_secs.into());
 		for (height, block_hash) in &matched {
 			confirm_block_transactions(
 				&requester,
 				*block_hash,
 				*height,
 				&confirmables,
+				per_request_timeout,
 				&self.logger,
 			)
 			.await?;
@@ -1181,12 +1194,18 @@ fn update_node_metrics_timestamp(
 /// Fetch a block by hash and call `transactions_confirmed` on each confirmable.
 async fn confirm_block_transactions(
 	requester: &Requester, block_hash: BlockHash, height: u32,
-	confirmables: &[&(dyn Confirm + Sync + Send)], logger: &Logger,
+	confirmables: &[&(dyn Confirm + Sync + Send)], per_request_timeout: Duration, logger: &Logger,
 ) -> Result<(), Error> {
-	let indexed_block = requester.get_block(block_hash).await.map_err(|e| {
-		log_error!(logger, "Failed to fetch block {}: {:?}", block_hash, e);
-		Error::TxSyncFailed
-	})?;
+	let indexed_block = tokio::time::timeout(per_request_timeout, requester.get_block(block_hash))
+		.await
+		.map_err(|_| {
+			log_error!(logger, "Timed out fetching block {}", block_hash);
+			Error::TxSyncFailed
+		})?
+		.map_err(|e| {
+			log_error!(logger, "Failed to fetch block {}: {:?}", block_hash, e);
+			Error::TxSyncFailed
+		})?;
 	let block = &indexed_block.block;
 	let header = &block.header;
 	let txdata: Vec<(usize, &Transaction)> = block.txdata.iter().enumerate().collect();
