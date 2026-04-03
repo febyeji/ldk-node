@@ -501,6 +501,19 @@ impl CbfChainSource {
 		}
 	}
 
+	/// Reset filter scan state to a clean baseline.
+	///
+	/// Called on both success and error paths in `run_filter_scan()` to ensure
+	/// no stale state leaks between scans.
+	fn cleanup_scan_state(&self) {
+		self.filter_skip_height.store(0, Ordering::Release);
+		self.watched_scripts.write().unwrap().clear();
+		self.matched_block_hashes.lock().unwrap().clear();
+		if let Some(tx) = self.sync_completion_tx.lock().unwrap().take() {
+			drop(tx);
+		}
+	}
+
 	/// Register a transaction script for Lightning channel monitoring.
 	pub(crate) fn register_tx(&self, _txid: &Txid, script_pubkey: &Script) {
 		self.registered_scripts.lock().unwrap().push(script_pubkey.to_owned());
@@ -530,21 +543,27 @@ impl CbfChainSource {
 		let (tx, rx) = oneshot::channel();
 		*self.sync_completion_tx.lock().unwrap() = Some(tx);
 
-		requester.rescan().map_err(|e| {
+		if let Err(e) = requester.rescan().map_err(|e| {
 			log_error!(self.logger, "Failed to trigger CBF rescan: {:?}", e);
 			Error::WalletOperationFailed
-		})?;
+		}) {
+			self.cleanup_scan_state();
+			return Err(e);
+		}
 
-		let sync_update = rx.await.map_err(|e| {
-			log_error!(self.logger, "CBF sync completion channel dropped: {:?}", e);
-			Error::WalletOperationFailed
-		})?;
-
-		self.filter_skip_height.store(0, Ordering::Release);
-		self.watched_scripts.write().unwrap().clear();
-		let matched = std::mem::take(&mut *self.matched_block_hashes.lock().unwrap());
-
-		Ok((sync_update, matched))
+		match rx.await {
+			Ok(sync_update) => {
+				self.filter_skip_height.store(0, Ordering::Release);
+				self.watched_scripts.write().unwrap().clear();
+				let matched = std::mem::take(&mut *self.matched_block_hashes.lock().unwrap());
+				Ok((sync_update, matched))
+			},
+			Err(e) => {
+				log_error!(self.logger, "CBF sync completion channel dropped: {:?}", e);
+				self.cleanup_scan_state();
+				Err(Error::WalletOperationFailed)
+			},
+		}
 	}
 
 	/// Sync the on-chain wallet by scanning compact block filters for relevant transactions.
