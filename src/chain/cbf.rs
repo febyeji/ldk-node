@@ -13,9 +13,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bdk_chain::{BlockId, ConfirmationBlockTime, TxUpdate};
 use bdk_wallet::Update;
-use bip157::chain::BlockHeaderChanges;
+use bip157::chain::{BlockHeaderChanges, ChainState};
 use bip157::{
-	BlockHash, Builder, Client, Event, Info, Requester, SyncUpdate, TrustedPeer, Warning,
+	BlockHash, Builder, Client, Event, HeaderCheckpoint, Info, Node as CbfNode, Requester,
+	SyncUpdate, TrustedPeer, Warning,
 };
 use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
 use bitcoin::{Amount, FeeRate, Network, Script, ScriptBuf, Transaction, Txid};
@@ -47,6 +48,12 @@ const FEE_RATE_LOOKBACK_BLOCKS: usize = 6;
 /// for reorg safety when computing the incremental scan skip height.
 /// Matches bdk-kyoto's `IMPOSSIBLE_REORG_DEPTH`.
 const REORG_SAFETY_BLOCKS: u32 = 7;
+
+/// Maximum consecutive restart attempts before giving up.
+const MAX_RESTART_RETRIES: u32 = 5;
+
+/// Initial backoff delay for restart retries (doubles each attempt).
+const INITIAL_BACKOFF_MS: u64 = 500;
 
 /// The fee estimation back-end used by the CBF chain source.
 enum FeeSource {
@@ -97,6 +104,8 @@ pub(super) struct CbfChainSource {
 	kv_store: Arc<DynStore>,
 	/// Node configuration (network, storage path, etc.).
 	config: Arc<Config>,
+	/// On-chain wallet reference for deriving chain_state checkpoints on restart.
+	onchain_wallet: Mutex<Option<Arc<Wallet>>>,
 	/// Logger instance.
 	logger: Arc<Logger>,
 	/// Shared node metrics (sync timestamps, etc.).
@@ -148,6 +157,7 @@ impl CbfChainSource {
 		let scan_lock = tokio::sync::Mutex::new(());
 		let onchain_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
 		let lightning_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
+		let onchain_wallet = Mutex::new(None);
 		Ok(Self {
 			peers,
 			sync_config,
@@ -163,6 +173,7 @@ impl CbfChainSource {
 			onchain_wallet_sync_status,
 			lightning_wallet_sync_status,
 			fee_estimator,
+			onchain_wallet,
 			kv_store,
 			config,
 			logger,
@@ -170,14 +181,13 @@ impl CbfChainSource {
 		})
 	}
 
-	/// Start the bip157 node and spawn background tasks for event processing.
-	pub(crate) fn start(&self, runtime: Arc<Runtime>) {
-		let mut status = self.cbf_runtime_status.lock().unwrap();
-		if matches!(*status, CbfRuntimeStatus::Started { .. }) {
-			debug_assert!(false, "We shouldn't call start if we're already started");
-			return;
-		}
-
+	/// Build a new bip157 node and client from the current configuration.
+	///
+	/// If an on-chain wallet reference is available, a `ChainState::Checkpoint`
+	/// is derived from the wallet's persisted checkpoint (walked back by
+	/// `REORG_SAFETY_BLOCKS`) so the node resumes near its last known height
+	/// instead of re-syncing from genesis.
+	fn build_cbf_node(&self) -> (CbfNode, Client) {
 		let network = self.config.network;
 
 		let mut builder = Builder::new(network);
@@ -210,7 +220,46 @@ impl CbfChainSource {
 		builder =
 			builder.response_timeout(Duration::from_secs(self.sync_config.response_timeout_secs));
 
-		let (node, client) = builder.build();
+		// If we have a wallet reference, derive a chain_state checkpoint so the
+		// bip157 node can skip already-synced headers on restart.
+		if let Some(wallet) = self.onchain_wallet.lock().unwrap().as_ref() {
+			let cp = wallet.latest_checkpoint();
+			let target_height = cp.height().saturating_sub(REORG_SAFETY_BLOCKS);
+			// Walk the checkpoint chain back to the target height.
+			let mut cursor = cp;
+			while cursor.height() > target_height {
+				match cursor.prev() {
+					Some(prev) => cursor = prev,
+					None => break,
+				}
+			}
+			if cursor.height() > 0 {
+				let header_cp = HeaderCheckpoint::new(cursor.height(), cursor.hash());
+				builder = builder.chain_state(ChainState::Checkpoint(header_cp));
+				log_debug!(
+					self.logger,
+					"CBF builder: resuming from checkpoint height={}, hash={}",
+					cursor.height(),
+					cursor.hash(),
+				);
+			}
+		}
+
+		builder.build()
+	}
+
+	/// Start the bip157 node and spawn background tasks for event processing.
+	pub(crate) fn start(&self, runtime: Arc<Runtime>, onchain_wallet: Arc<Wallet>) {
+		let mut status = self.cbf_runtime_status.lock().unwrap();
+		if matches!(*status, CbfRuntimeStatus::Started { .. }) {
+			debug_assert!(false, "We shouldn't call start if we're already started");
+			return;
+		}
+
+		// Store the wallet reference for future restarts.
+		*self.onchain_wallet.lock().unwrap() = Some(Arc::clone(&onchain_wallet));
+
+		let (node, client) = self.build_cbf_node();
 
 		let Client { requester, info_rx, warn_rx, event_rx } = client;
 
