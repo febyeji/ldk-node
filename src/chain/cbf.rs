@@ -481,7 +481,16 @@ impl CbfChainSource {
 	fn requester(&self) -> Result<Requester, Error> {
 		let status = self.cbf_runtime_status.lock().unwrap();
 		match &*status {
-			CbfRuntimeStatus::Started { requester } => Ok(requester.clone()),
+			CbfRuntimeStatus::Started { requester } if requester.is_running() => {
+				Ok(requester.clone())
+			},
+			CbfRuntimeStatus::Started { .. } => {
+				log_error!(
+					self.logger,
+					"CBF node is not running; sync will fail until restart completes."
+				);
+				Err(Error::ConnectionFailed)
+			},
 			CbfRuntimeStatus::Stopped => {
 				debug_assert!(
 					false,
