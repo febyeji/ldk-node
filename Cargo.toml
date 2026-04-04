@@ -54,6 +54,7 @@ lightning-macros = { git = "https://github.com/lightningdevkit/rust-lightning", 
 bdk_chain = { version = "0.23.0", default-features = false, features = ["std"] }
 bdk_esplora = { version = "0.22.0", default-features = false, features = ["async-https-rustls", "tokio"]}
 bdk_electrum = { version = "0.23.0", default-features = false, features = ["use-rustls-ring"]}
+bip157 = { version = "0.4.2", default-features = false }
 bdk_wallet = { version = "2.3.0", default-features = false, features = ["std", "keys-bip39"]}
 
 bitreq = { version = "0.3", default-features = false, features = ["async-https", "json-using-serde"] }
@@ -66,7 +67,7 @@ bip21 = { version = "0.5", features = ["std"], default-features = false }
 base64 = { version = "0.22.1", default-features = false, features = ["std"] }
 getrandom = { version = "0.3", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-tokio = { version = "1.37", default-features = false, features = [ "rt-multi-thread", "time", "sync", "macros", "net" ] }
+tokio = { version = "1.37", default-features = false, features = [ "rt-multi-thread", "time", "sync", "macros" ] }
 esplora-client = { version = "0.12", default-features = false, features = ["tokio", "async-https-rustls"] }
 electrum-client = { version = "0.24.0", default-features = false, features = ["proxy", "use-rustls-ring"] }
 libc = "0.2"
