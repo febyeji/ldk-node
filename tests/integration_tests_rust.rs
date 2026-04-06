@@ -24,7 +24,7 @@ use common::{
 	generate_listening_addresses, open_channel, open_channel_push_amt, open_channel_with_all,
 	premine_and_distribute_funds, premine_blocks, prepare_rbf, random_chain_source, random_config,
 	random_listening_addresses, setup_bitcoind_and_electrsd, setup_builder, setup_node,
-	setup_two_nodes, splice_in_with_all, skip_if_cbf, wait_for_cbf_sync, wait_for_tx,
+	setup_two_nodes, skip_if_cbf, splice_in_with_all, wait_for_cbf_sync, wait_for_tx,
 	TestChainSource, TestStoreType, TestSyncStore,
 };
 use electrsd::corepc_node::Node as BitcoinD;
@@ -2911,7 +2911,8 @@ async fn fee_rate_estimation_after_manual_sync_cbf() {
 	)
 	.await;
 
-	wait_for_cbf_sync(&node).await;
+	wait_for_cbf_sync(&node, || node.status().latest_fee_rate_cache_update_timestamp.is_some())
+		.await;
 	let first_fee_update = node.status().latest_fee_rate_cache_update_timestamp;
 	assert!(first_fee_update.is_some());
 
@@ -2941,7 +2942,10 @@ async fn repeated_manual_sync_cbf() {
 	)
 	.await;
 
-	wait_for_cbf_sync(&node).await;
+	wait_for_cbf_sync(&node, || {
+		node.list_balances().spendable_onchain_balance_sats == premine_amount_sat
+	})
+	.await;
 	assert_eq!(node.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
 
 	// Regression: the second manual sync must not block forever.
@@ -2986,7 +2990,10 @@ async fn start_stop_reinit_cbf() {
 	)
 	.await;
 
-	wait_for_cbf_sync(&node).await;
+	wait_for_cbf_sync(&node, || {
+		node.list_balances().spendable_onchain_balance_sats == expected_amount.to_sat()
+	})
+	.await;
 	assert_eq!(node.list_balances().spendable_onchain_balance_sats, expected_amount.to_sat());
 
 	node.stop().unwrap();
@@ -3014,7 +3021,11 @@ async fn start_stop_reinit_cbf() {
 		expected_amount.to_sat()
 	);
 
-	wait_for_cbf_sync(&reinitialized_node).await;
+	wait_for_cbf_sync(&reinitialized_node, || {
+		reinitialized_node.list_balances().spendable_onchain_balance_sats
+			== expected_amount.to_sat()
+	})
+	.await;
 	assert_eq!(
 		reinitialized_node.list_balances().spendable_onchain_balance_sats,
 		expected_amount.to_sat()
@@ -3044,7 +3055,10 @@ async fn onchain_wallet_recovery_cbf() {
 	)
 	.await;
 
-	wait_for_cbf_sync(&original_node).await;
+	wait_for_cbf_sync(&original_node, || {
+		original_node.list_balances().spendable_onchain_balance_sats == premine_amount_sat
+	})
+	.await;
 	assert_eq!(original_node.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
 
 	let addr_2 = original_node.onchain_payment().new_address().unwrap();
@@ -3060,7 +3074,10 @@ async fn onchain_wallet_recovery_cbf() {
 
 	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
 
-	wait_for_cbf_sync(&original_node).await;
+	wait_for_cbf_sync(&original_node, || {
+		original_node.list_balances().spendable_onchain_balance_sats == premine_amount_sat * 2
+	})
+	.await;
 	assert_eq!(
 		original_node.list_balances().spendable_onchain_balance_sats,
 		premine_amount_sat * 2
@@ -3075,7 +3092,10 @@ async fn onchain_wallet_recovery_cbf() {
 	recovered_config.recovery_mode = true;
 	let recovered_node = setup_node(&chain_source, recovered_config);
 
-	wait_for_cbf_sync(&recovered_node).await;
+	wait_for_cbf_sync(&recovered_node, || {
+		recovered_node.list_balances().spendable_onchain_balance_sats == premine_amount_sat * 2
+	})
+	.await;
 	assert_eq!(
 		recovered_node.list_balances().spendable_onchain_balance_sats,
 		premine_amount_sat * 2
@@ -3098,7 +3118,10 @@ async fn onchain_wallet_recovery_cbf() {
 
 	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
 
-	wait_for_cbf_sync(&recovered_node).await;
+	wait_for_cbf_sync(&recovered_node, || {
+		recovered_node.list_balances().spendable_onchain_balance_sats == premine_amount_sat * 3
+	})
+	.await;
 	assert_eq!(
 		recovered_node.list_balances().spendable_onchain_balance_sats,
 		premine_amount_sat * 3
@@ -3125,7 +3148,10 @@ async fn onchain_send_receive_cbf() {
 	)
 	.await;
 
-	wait_for_cbf_sync(&node_a).await;
+	wait_for_cbf_sync(&node_a, || {
+		node_a.list_balances().spendable_onchain_balance_sats == premine_amount_sat
+	})
+	.await;
 	node_b.sync_wallets().unwrap();
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
 	assert_eq!(node_b.list_balances().spendable_onchain_balance_sats, premine_amount_sat);
@@ -3156,7 +3182,7 @@ async fn onchain_send_receive_cbf() {
 
 	// Mine the transaction so CBF can see it.
 	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
-	wait_for_cbf_sync(&node_a).await;
+	wait_for_cbf_sync(&node_a, || node_a.payment(&PaymentId(txid.to_byte_array())).is_some()).await;
 	node_b.sync_wallets().unwrap();
 
 	let payment_id = PaymentId(txid.to_byte_array());
@@ -3201,7 +3227,7 @@ async fn onchain_send_receive_cbf() {
 	wait_for_tx(&electrsd.client, txid).await;
 
 	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
-	wait_for_cbf_sync(&node_a).await;
+	wait_for_cbf_sync(&node_a, || node_a.list_balances().spendable_onchain_balance_sats == 0).await;
 	node_b.sync_wallets().unwrap();
 
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, 0);
