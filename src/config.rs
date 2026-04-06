@@ -514,7 +514,7 @@ pub struct CbfSyncConfig {
 	/// of downloading incorrect filter headers. Setting this to 1 means filter headers from a
 	/// single peer are trusted without cross-validation.
 	///
-	/// Defaults to 2.
+	/// Defaults to 1.
 	pub required_peers: u8,
 }
 
@@ -524,7 +524,7 @@ impl Default for CbfSyncConfig {
 			background_sync_config: Some(BackgroundSyncConfig::default()),
 			timeouts_config: SyncTimeoutsConfig::default(),
 			response_timeout_secs: 30,
-			required_peers: 2,
+			required_peers: 1,
 		}
 	}
 }
