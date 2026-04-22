@@ -33,7 +33,7 @@ use crate::fee_estimator::{
 	apply_post_estimation_adjustments, get_all_conf_targets, get_num_block_defaults_for_target,
 	OnchainFeeEstimator,
 };
-use crate::io::utils::write_node_metrics;
+use crate::io::utils::update_and_persist_node_metrics;
 use crate::logger::{log_bytes, log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use crate::runtime::Runtime;
 use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
@@ -1186,10 +1186,9 @@ fn update_node_metrics_timestamp(
 	setter: impl FnOnce(&mut NodeMetrics, Option<u64>),
 ) -> Result<(), Error> {
 	let unix_time_secs_opt = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
-	let mut locked = node_metrics.write().unwrap();
-	setter(&mut locked, unix_time_secs_opt);
-	write_node_metrics(&*locked, kv_store, logger)?;
-	Ok(())
+	update_and_persist_node_metrics(node_metrics, kv_store, logger, |m| {
+		setter(m, unix_time_secs_opt);
+	})
 }
 
 /// Fetch a block by hash and call `transactions_confirmed` on each confirmable.
