@@ -117,12 +117,11 @@ pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
 pub use bip39;
 pub use bitcoin;
 use bitcoin::secp256k1::PublicKey;
-use bitcoin::BlockHash;
 #[cfg(feature = "uniffi")]
 pub use bitcoin::FeeRate;
 #[cfg(not(feature = "uniffi"))]
 use bitcoin::FeeRate;
-use bitcoin::{Address, Amount};
+use bitcoin::{Address, Amount, BlockHash};
 #[cfg(feature = "uniffi")]
 pub use builder::ArcedNodeBuilder as Builder;
 pub use builder::BuildError;
