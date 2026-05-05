@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -93,7 +93,7 @@ pub(super) struct CbfChainSource {
 	/// Serializes concurrent filter scans (on-chain and lightning).
 	scan_lock: tokio::sync::Mutex<()>,
 	/// Scripts registered by LDK's Filter trait for lightning channel monitoring.
-	registered_scripts: Mutex<Vec<ScriptBuf>>,
+	registered_scripts: Mutex<HashSet<ScriptBuf>>,
 	/// Deduplicates concurrent on-chain wallet sync requests.
 	onchain_wallet_sync_status: Mutex<WalletSyncStatus>,
 	/// Deduplicates concurrent lightning wallet sync requests.
@@ -151,7 +151,7 @@ impl CbfChainSource {
 		let matched_block_hashes = Arc::new(Mutex::new(Vec::new()));
 		let sync_completion_tx = Arc::new(Mutex::new(None));
 		let filter_skip_height = Arc::new(AtomicU32::new(0));
-		let registered_scripts = Mutex::new(Vec::new());
+		let registered_scripts = Mutex::new(HashSet::new());
 		let scan_lock = tokio::sync::Mutex::new(());
 		let onchain_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
 		let lightning_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
@@ -510,12 +510,12 @@ impl CbfChainSource {
 
 	/// Register a transaction script for Lightning channel monitoring.
 	pub(crate) fn register_tx(&self, _txid: &Txid, script_pubkey: &Script) {
-		self.registered_scripts.lock().expect("lock").push(script_pubkey.to_owned());
+		self.registered_scripts.lock().expect("lock").insert(script_pubkey.to_owned());
 	}
 
 	/// Register a watched output script for Lightning channel monitoring.
 	pub(crate) fn register_output(&self, output: WatchedOutput) {
-		self.registered_scripts.lock().expect("lock").push(output.script_pubkey.clone());
+		self.registered_scripts.lock().expect("lock").insert(output.script_pubkey.clone());
 	}
 
 	/// Run a CBF filter scan: set watched scripts, trigger a rescan, wait for
@@ -738,7 +738,8 @@ impl CbfChainSource {
 			let requester = self.requester()?;
 			let now = Instant::now();
 
-			let scripts: Vec<ScriptBuf> = self.registered_scripts.lock().expect("lock").clone();
+			let scripts: Vec<ScriptBuf> =
+				self.registered_scripts.lock().expect("lock").iter().cloned().collect();
 			if scripts.is_empty() {
 				log_debug!(self.logger, "No registered scripts for CBF lightning sync.");
 			} else {
