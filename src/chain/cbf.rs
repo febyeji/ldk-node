@@ -548,7 +548,14 @@ impl CbfChainSource {
 		let (tx, rx) = oneshot::channel();
 		*self.sync_completion_tx.lock().expect("lock") = Some(tx);
 
-		if let Err(e) = requester.rescan().map_err(|e| {
+		// Delegate the skip to kyoto so it doesn't re-stream filters we would discard
+		// client-side via filter_skip_height. Without `_from`, kyoto replays from its
+		// build-time checkpoint (potentially genesis on a fresh wallet) every tick.
+		let rescan_res = match skip_before_height {
+			Some(h) => requester.rescan_from(h),
+			None => requester.rescan(),
+		};
+		if let Err(e) = rescan_res.map_err(|e| {
 			log_error!(self.logger, "Failed to trigger CBF rescan: {:?}", e);
 			Error::WalletOperationFailed
 		}) {
