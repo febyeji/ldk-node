@@ -17,7 +17,7 @@ use bdk_wallet::{KeychainKind, Update};
 use bip157::chain::{BlockHeaderChanges, ChainState};
 use bip157::error::FetchBlockError;
 use bip157::{
-	BlockHash, Builder, Client, Event, HeaderCheckpoint, Info, Node as CbfNode, Requester,
+	BlockHash, Builder, Client, Event, HashCheckpoint, Info, Node as CbfNode, Requester,
 	SyncUpdate, TrustedPeer, Warning,
 };
 use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
@@ -242,7 +242,7 @@ impl CbfChainSource {
 				}
 			}
 			if cursor.height() > 0 {
-				let header_cp = HeaderCheckpoint::new(cursor.height(), cursor.hash());
+				let header_cp = HashCheckpoint::new(cursor.height(), cursor.hash());
 				builder = builder.chain_state(ChainState::Checkpoint(header_cp));
 				log_debug!(
 					logger,
