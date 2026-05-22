@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bdk_chain::indexer::keychain_txout::KeychainTxOutIndex;
 use bdk_chain::{BlockId, ConfirmationBlockTime, IndexedTxGraph, TxUpdate};
 use bdk_wallet::{KeychainKind, Update};
-use bip157::chain::{BlockHeaderChanges, ChainState};
+use bip157::chain::{BlockHeaderChanges, ChainState, IndexedHeader};
 use bip157::error::FetchBlockError;
 use bip157::{
 	BlockHash, Builder, Client, Event, HashCheckpoint, Info, Node as CbfNode, Requester,
@@ -86,6 +86,8 @@ pub(super) struct CbfChainSource {
 	watched_scripts: Arc<RwLock<Vec<ScriptBuf>>>,
 	/// Block (height, hash) pairs where filters matched watched scripts.
 	matched_block_hashes: Arc<Mutex<Vec<(u32, BlockHash)>>>,
+	/// Chain reorganization events queued for Lightning confirmation rollback.
+	reorg_queue: Arc<Mutex<Vec<ReorgEvent>>>,
 	/// One-shot channel sender to signal filter scan completion.
 	sync_completion_tx: Arc<Mutex<Option<oneshot::Sender<SyncUpdate>>>>,
 	/// Filters at or below this height are skipped during incremental scans.
@@ -121,8 +123,15 @@ enum CbfRuntimeStatus {
 struct CbfEventState {
 	watched_scripts: Arc<RwLock<Vec<ScriptBuf>>>,
 	matched_block_hashes: Arc<Mutex<Vec<(u32, BlockHash)>>>,
+	reorg_queue: Arc<Mutex<Vec<ReorgEvent>>>,
 	sync_completion_tx: Arc<Mutex<Option<oneshot::Sender<SyncUpdate>>>>,
 	filter_skip_height: Arc<AtomicU32>,
+}
+
+#[derive(Clone)]
+struct ReorgEvent {
+	reorganized: Vec<BlockHash>,
+	accepted: Vec<IndexedHeader>,
 }
 
 impl CbfChainSource {
@@ -149,6 +158,7 @@ impl CbfChainSource {
 		let cbf_runtime_status = Arc::new(Mutex::new(CbfRuntimeStatus::Stopped));
 		let watched_scripts = Arc::new(RwLock::new(Vec::new()));
 		let matched_block_hashes = Arc::new(Mutex::new(Vec::new()));
+		let reorg_queue = Arc::new(Mutex::new(Vec::new()));
 		let sync_completion_tx = Arc::new(Mutex::new(None));
 		let filter_skip_height = Arc::new(AtomicU32::new(0));
 		let registered_scripts = Mutex::new(HashSet::new());
@@ -163,6 +173,7 @@ impl CbfChainSource {
 			cbf_runtime_status,
 			watched_scripts,
 			matched_block_hashes,
+			reorg_queue,
 			sync_completion_tx,
 			filter_skip_height,
 			registered_scripts,
@@ -287,6 +298,7 @@ impl CbfChainSource {
 		let restart_logger = Arc::clone(&self.logger);
 		let restart_watched_scripts = Arc::clone(&self.watched_scripts);
 		let restart_matched_block_hashes = Arc::clone(&self.matched_block_hashes);
+		let restart_reorg_queue = Arc::clone(&self.reorg_queue);
 		let restart_sync_completion_tx = Arc::clone(&self.sync_completion_tx);
 		let restart_filter_skip_height = Arc::clone(&self.filter_skip_height);
 		let restart_peers = self.peers.clone();
@@ -315,6 +327,7 @@ impl CbfChainSource {
 				let event_state = CbfEventState {
 					watched_scripts: Arc::clone(&restart_watched_scripts),
 					matched_block_hashes: Arc::clone(&restart_matched_block_hashes),
+					reorg_queue: Arc::clone(&restart_reorg_queue),
 					sync_completion_tx: Arc::clone(&restart_sync_completion_tx),
 					filter_skip_height: Arc::clone(&restart_filter_skip_height),
 				};
@@ -452,6 +465,13 @@ impl CbfChainSource {
 							reorganized.len(),
 							accepted.len(),
 						);
+						let reorganized_hashes =
+							reorganized.iter().map(|h| h.block_hash()).collect();
+						state
+							.reorg_queue
+							.lock()
+							.expect("lock")
+							.push(ReorgEvent { reorganized: reorganized_hashes, accepted });
 
 						// No height reset needed: skip heights are derived from
 						// BDK's checkpoint (on-chain) and LDK's best block
@@ -758,36 +778,32 @@ impl CbfChainSource {
 
 			let scripts: Vec<ScriptBuf> =
 				self.registered_scripts.lock().expect("lock").iter().cloned().collect();
-			if scripts.is_empty() {
-				log_debug!(self.logger, "No registered scripts for CBF lightning sync.");
-			} else {
-				let timeout_fut = tokio::time::timeout(
-					Duration::from_secs(
-						self.sync_config.timeouts_config.lightning_wallet_sync_timeout_secs,
-					),
-					self.sync_lightning_wallet_op(
-						requester,
-						channel_manager,
-						chain_monitor,
-						output_sweeper,
-						scripts,
-					),
-				);
+			let timeout_fut = tokio::time::timeout(
+				Duration::from_secs(
+					self.sync_config.timeouts_config.lightning_wallet_sync_timeout_secs,
+				),
+				self.sync_lightning_wallet_op(
+					requester,
+					channel_manager,
+					chain_monitor,
+					output_sweeper,
+					scripts,
+				),
+			);
 
-				match timeout_fut.await {
-					Ok(res) => res?,
-					Err(e) => {
-						log_error!(self.logger, "Sync of Lightning wallet timed out: {}", e);
-						return Err(Error::TxSyncTimeout);
-					},
-				};
+			match timeout_fut.await {
+				Ok(res) => res?,
+				Err(e) => {
+					log_error!(self.logger, "Sync of Lightning wallet timed out: {}", e);
+					return Err(Error::TxSyncTimeout);
+				},
+			};
 
-				log_debug!(
-					self.logger,
-					"Sync of Lightning wallet via CBF finished in {}ms.",
-					now.elapsed().as_millis()
-				);
-			}
+			log_debug!(
+				self.logger,
+				"Sync of Lightning wallet via CBF finished in {}ms.",
+				now.elapsed().as_millis()
+			);
 
 			update_node_metrics_timestamp(
 				&self.node_metrics,
@@ -814,6 +830,17 @@ impl CbfChainSource {
 		&self, requester: Requester, channel_manager: Arc<ChannelManager>,
 		chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>, scripts: Vec<ScriptBuf>,
 	) -> Result<(), Error> {
+		let confirmables: Vec<&(dyn Confirm + Sync + Send)> =
+			vec![&*channel_manager, &*chain_monitor, &*output_sweeper];
+		let per_request_timeout =
+			Duration::from_secs(self.sync_config.timeouts_config.per_request_timeout_secs.into());
+
+		if scripts.is_empty() {
+			self.process_lightning_reorgs(&requester, &confirmables, per_request_timeout).await?;
+			log_debug!(self.logger, "No registered scripts for CBF lightning sync.");
+			return Ok(());
+		}
+
 		let skip_height =
 			channel_manager.current_best_block().height.checked_sub(REORG_SAFETY_BLOCKS);
 		let (sync_update, matched) = self.run_filter_scan(scripts, skip_height).await?;
@@ -824,16 +851,17 @@ impl CbfChainSource {
 			matched.len()
 		);
 
-		let confirmables: Vec<&(dyn Confirm + Sync + Send)> =
-			vec![&*channel_manager, &*chain_monitor, &*output_sweeper];
+		let reorg_confirmed_blocks =
+			self.process_lightning_reorgs(&requester, &confirmables, per_request_timeout).await?;
 
 		// Fetch matching blocks and confirm all their transactions.
 		// The compact block filter already matched our scripts (covering both
 		// created outputs and spent inputs), so we confirm every transaction
 		// from matched blocks and let LDK determine relevance.
-		let per_request_timeout =
-			Duration::from_secs(self.sync_config.timeouts_config.per_request_timeout_secs.into());
 		for (height, block_hash) in &matched {
+			if reorg_confirmed_blocks.contains(block_hash) {
+				continue;
+			}
 			confirm_block_transactions(
 				&requester,
 				*block_hash,
@@ -854,6 +882,60 @@ impl CbfChainSource {
 		}
 
 		Ok(())
+	}
+
+	async fn process_lightning_reorgs(
+		&self, requester: &Requester, confirmables: &[&(dyn Confirm + Sync + Send)],
+		per_request_timeout: Duration,
+	) -> Result<HashSet<BlockHash>, Error> {
+		let pending_reorgs = self.reorg_queue.lock().expect("lock").clone();
+		if pending_reorgs.is_empty() {
+			return Ok(HashSet::new());
+		}
+
+		let mut confirmed_blocks = HashSet::new();
+		for reorg in &pending_reorgs {
+			let reorganized_blocks: HashSet<BlockHash> =
+				reorg.reorganized.iter().copied().collect();
+			let unconfirmed = unconfirm_reorganized_transactions(confirmables, &reorganized_blocks);
+			log_debug!(
+				self.logger,
+				"CBF lightning reorg handling unconfirmed {} transactions from {} blocks.",
+				unconfirmed,
+				reorganized_blocks.len()
+			);
+
+			let mut accepted = reorg.accepted.clone();
+			accepted.sort_by_key(|header| header.height);
+			for header in &accepted {
+				let block_hash = header.header.block_hash();
+				if !confirmed_blocks.insert(block_hash) {
+					continue;
+				}
+				confirm_block_transactions(
+					requester,
+					block_hash,
+					header.height,
+					confirmables,
+					per_request_timeout,
+					&self.logger,
+				)
+				.await?;
+			}
+
+			if let Some(last_accepted) = accepted.last() {
+				for confirmable in confirmables {
+					confirmable.best_block_updated(&last_accepted.header, last_accepted.height);
+				}
+			}
+		}
+
+		let processed_count = pending_reorgs.len();
+		let mut reorg_queue = self.reorg_queue.lock().expect("lock");
+		let drain_count = processed_count.min(reorg_queue.len());
+		reorg_queue.drain(0..drain_count);
+
+		Ok(confirmed_blocks)
 	}
 
 	pub(crate) async fn update_fee_rate_estimates(&self) -> Result<(), Error> {
@@ -1239,6 +1321,21 @@ fn update_node_metrics_timestamp(
 	})
 }
 
+fn unconfirm_reorganized_transactions(
+	confirmables: &[&(dyn Confirm + Sync + Send)], reorganized_blocks: &HashSet<BlockHash>,
+) -> usize {
+	let mut unconfirmed = 0;
+	for confirmable in confirmables {
+		for (txid, _height, block_hash_opt) in confirmable.get_relevant_txids() {
+			if block_hash_opt.is_some_and(|block_hash| reorganized_blocks.contains(&block_hash)) {
+				confirmable.transaction_unconfirmed(&txid);
+				unconfirmed += 1;
+			}
+		}
+	}
+	unconfirmed
+}
+
 /// Fetch a block by hash and call `transactions_confirmed` on each confirmable.
 async fn confirm_block_transactions(
 	requester: &Requester, block_hash: BlockHash, height: u32,
@@ -1302,18 +1399,85 @@ fn select_fee_rate_for_target(sorted_rates: &[u64], num_blocks: usize) -> FeeRat
 
 #[cfg(test)]
 mod tests {
-	use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
-	use bitcoin::{Amount, FeeRate};
+	use std::collections::HashSet;
+	use std::sync::Mutex;
 
-	use super::{block_subsidy, select_fee_rate_for_target, MIN_FEERATE_SAT_PER_KWU};
+	use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
+	use bitcoin::hashes::{sha256d, Hash, HashEngine};
+	use bitcoin::{Amount, BlockHash, FeeRate, Txid};
+	use lightning::chain::transaction::TransactionData;
+	use lightning::chain::Confirm;
+
+	use super::{
+		block_subsidy, select_fee_rate_for_target, unconfirm_reorganized_transactions,
+		MIN_FEERATE_SAT_PER_KWU,
+	};
 	use crate::fee_estimator::{
 		apply_post_estimation_adjustments, get_all_conf_targets, get_num_block_defaults_for_target,
 	};
+
+	fn test_block_hash(seed: u32) -> BlockHash {
+		let mut engine = sha256d::Hash::engine();
+		engine.input(&seed.to_le_bytes());
+		BlockHash::from_raw_hash(sha256d::Hash::from_engine(engine))
+	}
+
+	fn test_txid(seed: u32) -> Txid {
+		let mut engine = sha256d::Hash::engine();
+		engine.input(&seed.to_le_bytes());
+		Txid::from_raw_hash(sha256d::Hash::from_engine(engine))
+	}
+
+	struct TestConfirm {
+		relevant_txids: Vec<(Txid, u32, Option<BlockHash>)>,
+		unconfirmed_txids: Mutex<Vec<Txid>>,
+	}
+
+	impl Confirm for TestConfirm {
+		fn transactions_confirmed(
+			&self, _header: &bitcoin::block::Header, _txdata: &TransactionData, _height: u32,
+		) {
+		}
+
+		fn transaction_unconfirmed(&self, txid: &Txid) {
+			self.unconfirmed_txids.lock().expect("lock").push(*txid);
+		}
+
+		fn best_block_updated(&self, _header: &bitcoin::block::Header, _height: u32) {}
+
+		fn get_relevant_txids(&self) -> Vec<(Txid, u32, Option<BlockHash>)> {
+			self.relevant_txids.clone()
+		}
+	}
 
 	#[test]
 	fn select_fee_rate_empty_returns_floor() {
 		let rate = select_fee_rate_for_target(&[], 1);
 		assert_eq!(rate, FeeRate::from_sat_per_kwu(MIN_FEERATE_SAT_PER_KWU));
+	}
+
+	#[test]
+	fn unconfirm_reorganized_transactions_only_matches_removed_blocks() {
+		let stale_block = test_block_hash(1);
+		let active_block = test_block_hash(2);
+		let stale_txid = test_txid(10);
+		let active_txid = test_txid(20);
+		let unconfirmed_txid = test_txid(30);
+		let confirmable = TestConfirm {
+			relevant_txids: vec![
+				(stale_txid, 100, Some(stale_block)),
+				(active_txid, 101, Some(active_block)),
+				(unconfirmed_txid, 0, None),
+			],
+			unconfirmed_txids: Mutex::new(Vec::new()),
+		};
+		let confirmables: Vec<&(dyn Confirm + Sync + Send)> = vec![&confirmable];
+		let reorganized_blocks = HashSet::from([stale_block]);
+
+		let unconfirmed = unconfirm_reorganized_transactions(&confirmables, &reorganized_blocks);
+
+		assert_eq!(unconfirmed, 1);
+		assert_eq!(*confirmable.unconfirmed_txids.lock().expect("lock"), vec![stale_txid]);
 	}
 
 	#[test]
