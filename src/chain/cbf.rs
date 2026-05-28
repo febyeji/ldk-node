@@ -91,6 +91,8 @@ pub(super) struct CbfChainSource {
 	watched_scripts: Arc<RwLock<Vec<ScriptBuf>>>,
 	/// Block (height, hash) pairs where filters matched watched scripts.
 	matched_block_hashes: Arc<Mutex<Vec<(u32, BlockHash)>>>,
+	/// Blocks removed from the best chain that still need to be reflected into LDK.
+	pending_reorganized_blocks: Arc<Mutex<Vec<(u32, BlockHash)>>>,
 	/// One-shot channel sender to signal filter scan completion.
 	sync_completion_tx: Arc<Mutex<Option<oneshot::Sender<SyncUpdate>>>>,
 	/// Filters at or below this height are skipped during incremental scans.
@@ -131,8 +133,31 @@ enum CbfRuntimeStatus {
 struct CbfEventState {
 	watched_scripts: Arc<RwLock<Vec<ScriptBuf>>>,
 	matched_block_hashes: Arc<Mutex<Vec<(u32, BlockHash)>>>,
+	pending_reorganized_blocks: Arc<Mutex<Vec<(u32, BlockHash)>>>,
 	sync_completion_tx: Arc<Mutex<Option<oneshot::Sender<SyncUpdate>>>>,
 	filter_skip_height: Arc<AtomicU32>,
+}
+
+fn txids_reorganized_out(
+	confirmables: &[&(dyn Confirm + Sync + Send)], reorganized_blocks: &HashSet<(u32, BlockHash)>,
+) -> HashSet<Txid> {
+	let reorganized_heights: HashSet<u32> =
+		reorganized_blocks.iter().map(|(height, _)| *height).collect();
+	let mut txids_to_unconfirm = HashSet::new();
+
+	for confirmable in confirmables {
+		for (txid, height, block_hash) in confirmable.get_relevant_txids() {
+			let was_reorganized = match block_hash {
+				Some(block_hash) => reorganized_blocks.contains(&(height, block_hash)),
+				None => reorganized_heights.contains(&height),
+			};
+			if was_reorganized {
+				txids_to_unconfirm.insert(txid);
+			}
+		}
+	}
+
+	txids_to_unconfirm
 }
 
 impl CbfChainSource {
@@ -159,6 +184,7 @@ impl CbfChainSource {
 		let cbf_runtime_status = Arc::new(Mutex::new(CbfRuntimeStatus::Stopped));
 		let watched_scripts = Arc::new(RwLock::new(Vec::new()));
 		let matched_block_hashes = Arc::new(Mutex::new(Vec::new()));
+		let pending_reorganized_blocks = Arc::new(Mutex::new(Vec::new()));
 		let sync_completion_tx = Arc::new(Mutex::new(None));
 		let filter_skip_height = Arc::new(AtomicU32::new(0));
 		let registered_scripts = Mutex::new(HashSet::new());
@@ -174,6 +200,7 @@ impl CbfChainSource {
 			cbf_runtime_status,
 			watched_scripts,
 			matched_block_hashes,
+			pending_reorganized_blocks,
 			sync_completion_tx,
 			filter_skip_height,
 			registered_scripts,
@@ -299,6 +326,7 @@ impl CbfChainSource {
 		let restart_logger = Arc::clone(&self.logger);
 		let restart_watched_scripts = Arc::clone(&self.watched_scripts);
 		let restart_matched_block_hashes = Arc::clone(&self.matched_block_hashes);
+		let restart_pending_reorganized_blocks = Arc::clone(&self.pending_reorganized_blocks);
 		let restart_sync_completion_tx = Arc::clone(&self.sync_completion_tx);
 		let restart_filter_skip_height = Arc::clone(&self.filter_skip_height);
 		let restart_peers = self.peers.clone();
@@ -327,6 +355,7 @@ impl CbfChainSource {
 				let event_state = CbfEventState {
 					watched_scripts: Arc::clone(&restart_watched_scripts),
 					matched_block_hashes: Arc::clone(&restart_matched_block_hashes),
+					pending_reorganized_blocks: Arc::clone(&restart_pending_reorganized_blocks),
 					sync_completion_tx: Arc::clone(&restart_sync_completion_tx),
 					filter_skip_height: Arc::clone(&restart_filter_skip_height),
 				};
@@ -464,6 +493,14 @@ impl CbfChainSource {
 							reorganized.len(),
 							accepted.len(),
 						);
+
+						let mut pending = state.pending_reorganized_blocks.lock().expect("lock");
+						for header in reorganized {
+							let block = (header.height, header.block_hash());
+							if !pending.contains(&block) {
+								pending.push(block);
+							}
+						}
 
 						// No height reset needed: skip heights are derived from
 						// BDK's checkpoint (on-chain) and LDK's best block
@@ -838,6 +875,7 @@ impl CbfChainSource {
 
 		let confirmables: Vec<&(dyn Confirm + Sync + Send)> =
 			vec![&*channel_manager, &*chain_monitor, &*output_sweeper];
+		self.unconfirm_reorganized_transactions(&confirmables);
 
 		// Fetch matching blocks and confirm all their transactions.
 		// The compact block filter already matched our scripts (covering both
@@ -866,6 +904,33 @@ impl CbfChainSource {
 		}
 
 		Ok(())
+	}
+
+	fn unconfirm_reorganized_transactions(&self, confirmables: &[&(dyn Confirm + Sync + Send)]) {
+		let reorganized_blocks =
+			std::mem::take(&mut *self.pending_reorganized_blocks.lock().expect("lock"));
+		if reorganized_blocks.is_empty() {
+			return;
+		}
+
+		let reorganized_blocks: HashSet<(u32, BlockHash)> =
+			reorganized_blocks.into_iter().collect();
+		let txids_to_unconfirm = txids_reorganized_out(confirmables, &reorganized_blocks);
+
+		if txids_to_unconfirm.is_empty() {
+			return;
+		}
+
+		log_debug!(
+			self.logger,
+			"Unconfirming {} Lightning transactions from CBF reorged blocks.",
+			txids_to_unconfirm.len(),
+		);
+		for txid in txids_to_unconfirm {
+			for confirmable in confirmables {
+				confirmable.transaction_unconfirmed(&txid);
+			}
+		}
 	}
 
 	pub(crate) async fn update_fee_rate_estimates(&self) -> Result<(), Error> {
@@ -1361,12 +1426,80 @@ fn select_fee_rate_for_target(sorted_rates: &[FeeRate], num_blocks: usize) -> Fe
 #[cfg(test)]
 mod tests {
 	use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
-	use bitcoin::{Amount, FeeRate};
+	use bitcoin::{Amount, BlockHash, FeeRate, Txid};
+	use lightning::chain::transaction::TransactionData;
+	use lightning::chain::Confirm;
+	use std::collections::HashSet;
 
-	use super::{block_subsidy, select_fee_rate_for_target, MIN_FEERATE_SAT_PER_KWU};
+	use super::{
+		block_subsidy, select_fee_rate_for_target, txids_reorganized_out, MIN_FEERATE_SAT_PER_KWU,
+	};
 	use crate::fee_estimator::{
 		apply_post_estimation_adjustments, get_all_conf_targets, get_num_block_defaults_for_target,
 	};
+
+	struct TestConfirm {
+		relevant_txids: Vec<(Txid, u32, Option<BlockHash>)>,
+	}
+
+	impl Confirm for TestConfirm {
+		fn transactions_confirmed(
+			&self, _header: &bitcoin::block::Header, _txdata: &TransactionData<'_>, _height: u32,
+		) {
+		}
+
+		fn transaction_unconfirmed(&self, _txid: &Txid) {}
+
+		fn best_block_updated(&self, _header: &bitcoin::block::Header, _height: u32) {}
+
+		fn get_relevant_txids(&self) -> Vec<(Txid, u32, Option<BlockHash>)> {
+			self.relevant_txids.clone()
+		}
+	}
+
+	fn txid(seed: u32) -> Txid {
+		use bitcoin::hashes::{sha256d, Hash, HashEngine};
+		let mut engine = sha256d::Hash::engine();
+		engine.input(&seed.to_le_bytes());
+		Txid::from_raw_hash(sha256d::Hash::from_engine(engine))
+	}
+
+	fn hash(seed: u32) -> BlockHash {
+		use bitcoin::hashes::{sha256d, Hash, HashEngine};
+		let mut engine = sha256d::Hash::engine();
+		engine.input(&seed.to_le_bytes());
+		BlockHash::from_raw_hash(sha256d::Hash::from_engine(engine))
+	}
+
+	#[test]
+	fn txids_reorganized_out_matches_reorged_blocks() {
+		let tx_exact_hash = txid(1);
+		let tx_height_only = txid(2);
+		let tx_wrong_hash = txid(3);
+		let tx_wrong_height = txid(4);
+		let removed_hash = hash(101);
+
+		let confirm_a = TestConfirm {
+			relevant_txids: vec![
+				(tx_exact_hash, 42, Some(removed_hash)),
+				(tx_height_only, 43, None),
+				(tx_wrong_hash, 42, Some(hash(102))),
+				(tx_wrong_height, 44, Some(hash(103))),
+			],
+		};
+		let confirm_b =
+			TestConfirm { relevant_txids: vec![(tx_exact_hash, 42, Some(removed_hash))] };
+		let confirmables: Vec<&(dyn Confirm + Sync + Send)> = vec![&confirm_a, &confirm_b];
+		let reorganized_blocks = HashSet::from([(42, removed_hash), (43, hash(104))]);
+
+		let unconfirmed = txids_reorganized_out(&confirmables, &reorganized_blocks);
+
+		assert_eq!(unconfirmed.len(), 2);
+		assert!(unconfirmed.contains(&tx_exact_hash));
+		assert!(unconfirmed.contains(&tx_height_only));
+		assert!(!unconfirmed.contains(&tx_wrong_hash));
+		assert!(!unconfirmed.contains(&tx_wrong_height));
+	}
 
 	#[test]
 	fn select_fee_rate_empty_returns_floor() {
