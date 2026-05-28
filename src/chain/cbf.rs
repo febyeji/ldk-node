@@ -135,6 +135,29 @@ struct CbfEventState {
 	filter_skip_height: Arc<AtomicU32>,
 }
 
+struct ScanStateCleanupGuard<'a> {
+	chain_source: &'a CbfChainSource,
+	armed: bool,
+}
+
+impl<'a> ScanStateCleanupGuard<'a> {
+	fn new(chain_source: &'a CbfChainSource) -> Self {
+		Self { chain_source, armed: true }
+	}
+
+	fn disarm(&mut self) {
+		self.armed = false;
+	}
+}
+
+impl Drop for ScanStateCleanupGuard<'_> {
+	fn drop(&mut self) {
+		if self.armed {
+			self.chain_source.cleanup_scan_state();
+		}
+	}
+}
+
 impl CbfChainSource {
 	pub(crate) fn new(
 		peers: Vec<String>, sync_config: CbfSyncConfig, fee_source_config: Option<FeeSourceConfig>,
@@ -569,6 +592,7 @@ impl CbfChainSource {
 
 		let (tx, rx) = oneshot::channel();
 		*self.sync_completion_tx.lock().expect("lock") = Some(tx);
+		let mut cleanup_guard = ScanStateCleanupGuard::new(self);
 
 		// Delegate the skip to kyoto so it doesn't re-stream filters we would discard
 		// client-side via filter_skip_height. Without `_from`, kyoto replays from its
@@ -581,7 +605,6 @@ impl CbfChainSource {
 			log_error!(self.logger, "Failed to trigger CBF rescan: {:?}", e);
 			Error::WalletOperationFailed
 		}) {
-			self.cleanup_scan_state();
 			return Err(e);
 		}
 
@@ -590,11 +613,11 @@ impl CbfChainSource {
 				self.filter_skip_height.store(0, Ordering::Release);
 				self.watched_scripts.write().expect("lock").clear();
 				let matched = std::mem::take(&mut *self.matched_block_hashes.lock().expect("lock"));
+				cleanup_guard.disarm();
 				Ok((sync_update, matched))
 			},
 			Err(e) => {
 				log_error!(self.logger, "CBF sync completion channel dropped: {:?}", e);
-				self.cleanup_scan_state();
 				Err(Error::WalletOperationFailed)
 			},
 		}
@@ -1039,31 +1062,16 @@ impl CbfChainSource {
 			let block = &indexed_block.block;
 			let weight_kwu = block.weight().to_kwu_floor();
 
-			// Compute fee rate: (coinbase_output - subsidy) / weight.
-			// For blocks with zero weight (e.g. coinbase-only in regtest), use the floor rate.
-			let fee_rate_sat_per_kwu = if weight_kwu == 0 {
-				MIN_FEERATE_SAT_PER_KWU
-			} else {
-				let subsidy = block_subsidy(height);
-				let revenue = block
-					.txdata
-					.first()
-					.map(|tx| tx.output.iter().map(|o| o.value).sum())
-					.unwrap_or(Amount::ZERO);
-				let block_fees = revenue.checked_sub(subsidy).unwrap_or(Amount::ZERO);
-
-				if block_fees == Amount::ZERO && self.config.network == Network::Bitcoin {
-					log_error!(
-						self.logger,
-						"Failed to retrieve fee rate estimates: zero block fees are disallowed on Mainnet.",
-					);
-					return Err(Error::FeerateEstimationUpdateFailed);
-				}
-
-				(block_fees.to_sat() / weight_kwu).max(MIN_FEERATE_SAT_PER_KWU)
-			};
-
-			let fee_rate = FeeRate::from_sat_per_kwu(fee_rate_sat_per_kwu);
+			// Compute fee rate: (coinbase_output - subsidy) / weight. Zero-fee blocks
+			// are valid on mainnet, so they are represented by the minimum floor rate.
+			let subsidy = block_subsidy(height);
+			let revenue = block
+				.txdata
+				.first()
+				.map(|tx| tx.output.iter().map(|o| o.value).sum())
+				.unwrap_or(Amount::ZERO);
+			let block_fees = revenue.checked_sub(subsidy).unwrap_or(Amount::ZERO);
+			let fee_rate = fee_rate_from_block_fees(block_fees, weight_kwu);
 
 			// Insert into the cache, evicting the oldest entry if at capacity.
 			{
@@ -1343,6 +1351,15 @@ fn block_subsidy(height: u32) -> Amount {
 	Amount::from_sat(base >> halvings)
 }
 
+fn fee_rate_from_block_fees(block_fees: Amount, weight_kwu: u64) -> FeeRate {
+	let fee_rate_sat_per_kwu = if weight_kwu == 0 {
+		MIN_FEERATE_SAT_PER_KWU
+	} else {
+		(block_fees.to_sat() / weight_kwu).max(MIN_FEERATE_SAT_PER_KWU)
+	};
+	FeeRate::from_sat_per_kwu(fee_rate_sat_per_kwu)
+}
+
 /// Select a fee rate from sorted block fee rates based on confirmation urgency.
 ///
 /// For urgent targets (1 block), uses the highest observed fee rate.
@@ -1373,7 +1390,10 @@ mod tests {
 	use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
 	use bitcoin::{Amount, FeeRate};
 
-	use super::{block_subsidy, select_fee_rate_for_target, MIN_FEERATE_SAT_PER_KWU};
+	use super::{
+		block_subsidy, fee_rate_from_block_fees, select_fee_rate_for_target,
+		MIN_FEERATE_SAT_PER_KWU,
+	};
 	use crate::fee_estimator::{
 		apply_post_estimation_adjustments, get_all_conf_targets, get_num_block_defaults_for_target,
 	};
@@ -1487,6 +1507,24 @@ mod tests {
 	fn block_subsidy_exhausted_after_64_halvings() {
 		assert_eq!(block_subsidy(SUBSIDY_HALVING_INTERVAL * 64), Amount::ZERO);
 		assert_eq!(block_subsidy(SUBSIDY_HALVING_INTERVAL * 100), Amount::ZERO);
+	}
+
+	#[test]
+	fn fee_rate_from_zero_block_fees_returns_floor() {
+		let rate = fee_rate_from_block_fees(Amount::ZERO, 4_000);
+		assert_eq!(rate, FeeRate::from_sat_per_kwu(MIN_FEERATE_SAT_PER_KWU));
+	}
+
+	#[test]
+	fn fee_rate_from_zero_weight_returns_floor() {
+		let rate = fee_rate_from_block_fees(Amount::from_sat(10_000), 0);
+		assert_eq!(rate, FeeRate::from_sat_per_kwu(MIN_FEERATE_SAT_PER_KWU));
+	}
+
+	#[test]
+	fn fee_rate_from_block_fees_uses_computed_rate_when_above_floor() {
+		let rate = fee_rate_from_block_fees(Amount::from_sat(20_000), 4);
+		assert_eq!(rate, FeeRate::from_sat_per_kwu(5_000));
 	}
 
 	#[test]
