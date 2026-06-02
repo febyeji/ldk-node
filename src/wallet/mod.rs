@@ -135,6 +135,10 @@ impl Wallet {
 			.collect()
 	}
 
+	pub(crate) fn latest_checkpoint(&self) -> bdk_chain::local_chain::CheckPoint {
+		self.inner.lock().expect("lock").latest_checkpoint()
+	}
+
 	pub(crate) fn current_best_block(&self) -> BlockLocator {
 		let checkpoint = self.inner.lock().expect("lock").latest_checkpoint();
 		let mut current_block = Some(checkpoint.clone());
