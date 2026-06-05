@@ -42,6 +42,7 @@ use crate::fee_estimator::{
 use crate::io::utils::update_and_persist_node_metrics;
 use crate::logger::{log_bytes, log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
+use crate::BestBlock;
 use crate::{Error, NodeMetrics};
 
 const CHAIN_POLLING_INTERVAL_SECS: u64 = 2;
@@ -1341,11 +1342,36 @@ pub(crate) enum FeeRateEstimationMode {
 	Conservative,
 }
 
+#[derive(Clone)]
 pub(crate) struct ChainListener {
 	pub(crate) onchain_wallet: Arc<Wallet>,
 	pub(crate) channel_manager: Arc<ChannelManager>,
 	pub(crate) chain_monitor: Arc<ChainMonitor>,
 	pub(crate) output_sweeper: Arc<Sweeper>,
+}
+
+impl ChainListener {
+	pub(crate) fn get_best_block(&self) -> BlockLocator {
+		let candidates = [
+			self.onchain_wallet.current_best_block(),
+			self.channel_manager.current_best_block(),
+			self.output_sweeper.current_best_block(),
+		];
+		let mut min = candidates.into_iter().min_by_key(|b| b.height).expect("non-empty");
+		if let Some(worst_monitor) = self
+			.chain_monitor
+			.list_monitors()
+			.iter()
+			.flat_map(|id| self.chain_monitor.get_monitor(*id))
+			.map(|m| m.current_best_block())
+			.min_by_key(|b| b.height)
+		{
+			if worst_monitor.height < min.height {
+				min = worst_monitor;
+			}
+		}
+		min
+	}
 }
 
 impl Listen for ChainListener {
