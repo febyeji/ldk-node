@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use bip157::chain::ChainState;
 use bip157::{
-	Builder as CbfBuilder, Client, HashCheckpoint, Info, Node as CbfNode, Requester, TrustedPeer,
+	Builder as KyotoBuilder, Client, HashCheckpoint, Info, Node as KyotoNode, Requester, TrustedPeer,
 	Warning,
 };
 use bitcoin::{BlockHash, FeeRate, Script, ScriptBuf, Txid};
@@ -109,23 +109,24 @@ impl CbfChainSource {
 		})
 	}
 
+    //builds kyoto
 	fn build(
 		trusted_peers: &[TrustedPeer], config: &Config, logger: &Logger,
 		chain_listener: &ChainListener,
-	) -> (CbfNode, Client) {
-		let mut cbf_builder = CbfBuilder::new(config.network);
+	) -> (KyotoNode, Client) {
+		let mut kyoto_builder = KyotoBuilder::new(config.network);
 
 		let data_dir = std::path::PathBuf::from(&config.storage_dir_path).join("bip157_data");
-		cbf_builder = cbf_builder.data_dir(data_dir);
+		kyoto_builder = kyoto_builder.data_dir(data_dir);
 
 		if !trusted_peers.is_empty() {
-			cbf_builder = cbf_builder.add_peers(trusted_peers.to_vec());
+			kyoto_builder = kyoto_builder.add_peers(trusted_peers.to_vec());
 		}
 
-		cbf_builder = cbf_builder.required_peers(DEFAULT_REQUIRED_PEERS);
-		cbf_builder = cbf_builder.fetch_witness_data();
-		cbf_builder =
-			cbf_builder.response_timeout(Duration::from_secs(DEFAULT_RESPONSE_TIMEOUT_SECS));
+		kyoto_builder = kyoto_builder.required_peers(DEFAULT_REQUIRED_PEERS);
+		kyoto_builder = kyoto_builder.fetch_witness_data();
+		kyoto_builder =
+			kyoto_builder.response_timeout(Duration::from_secs(DEFAULT_RESPONSE_TIMEOUT_SECS));
 
 		if let Some(header_cp) = Self::resume_checkpoint(logger, chain_listener) {
 			log_debug!(
@@ -134,10 +135,11 @@ impl CbfChainSource {
 				header_cp.height,
 				header_cp.hash,
 			);
-			cbf_builder = cbf_builder.chain_state(ChainState::Checkpoint(header_cp));
+			kyoto_builder = kyoto_builder.chain_state(ChainState::Checkpoint(header_cp));
 		}
 
-		cbf_builder.build()
+        
+		kyoto_builder.build()
 	}
 
 	fn resume_checkpoint(
@@ -173,6 +175,12 @@ impl CbfChainSource {
 	}
 
 	pub(crate) fn start(&self, runtime: Arc<Runtime>, chain_listener: ChainListener) {
+        //we populate registered scripts with all the scripts from the onchain wallet
+        for script in chain_listener.onchain_wallet.list_revealed_scripts() {
+            self.register_script(script);
+        }
+        
+
 		let (node, client) =
 			Self::build(&self.trusted_peers, &self.config, &self.logger, &chain_listener);
 		let Client { requester, info_rx, warn_rx, event_rx: _ } = client;
@@ -292,15 +300,21 @@ impl CbfChainSource {
 		_channel_manager: Arc<ChannelManager>, _chain_monitor: Arc<ChainMonitor>,
 		_output_sweeper: Arc<Sweeper>,
 	) {
+        //here we need to calculate chain update and feed to all listeners
 		todo!();
 	}
 
-	pub(crate) fn register_tx(&self, _txid: &Txid, _script_pubkey: &Script) {
-		todo!();
+	pub(crate) fn register_tx(&self, _txid: &Txid, script_pubkey: &Script) {
+		self.registered_scripts.lock().expect("lock").insert(script_pubkey.into());
 	}
 
-	pub(crate) fn register_output(&self, _output: WatchedOutput) {
-		todo!();
-		// self.registered_scripts.lock().expect("lock").insert(output.script_pubkey.clone());
+	pub(crate) fn register_output(&self, output: WatchedOutput) {
+		self.registered_scripts.lock().expect("lock").insert(output.script_pubkey);
 	}
+
+    pub(crate) fn register_script(&self, script: ScriptBuf) {
+        self.registered_scripts.lock().expect("lock").insert(script);
+    }
+
+
 }
