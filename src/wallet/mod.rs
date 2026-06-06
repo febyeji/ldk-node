@@ -35,7 +35,7 @@ use lightning::chain::chaininterface::{
 	BroadcasterInterface, INCREMENTAL_RELAY_FEE_SAT_PER_1000_WEIGHT,
 };
 use lightning::chain::channelmonitor::ANTI_REORG_DELAY;
-use lightning::chain::{BlockLocator, ClaimId, Listen, Filter};
+use lightning::chain::{BlockLocator, ClaimId, Filter, Listen};
 use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::inbound_payment::ExpandedKey;
 use lightning::ln::msgs::UnsignedGossipMessage;
@@ -223,26 +223,25 @@ impl Wallet {
 		Ok(())
 	}
 
-    pub(crate) fn list_revealed_scripts(&self) -> Vec<ScriptBuf> {
-        self.inner
-            .lock()
-            .expect("lock")
-            .spk_index()
-            .revealed_spks(..)
-            .map(|((_keychain, _index), spk)| spk)
-            .collect()
-    }
+	pub(crate) fn list_revealed_scripts(&self) -> Vec<ScriptBuf> {
+		self.inner
+			.lock()
+			.expect("lock")
+			.spk_index()
+			.revealed_spks(..)
+			.map(|((_keychain, _index), spk)| spk)
+			.collect()
+	}
 
+	/// Register scripts that BDK revealed at index time (e.g. change outputs, which `create_tx`
+	/// only peeks) with the chain source's watch set. No-op for non-CBF backends.
+	fn register_revealed_scripts(&self, _locked_wallet: &PersistedWallet<KVStoreWalletPersister>) {
+		// TODO(cbf): diff `last_revealed_index(keychain)` against a per-keychain cursor and
+		// `chain_source.register_script(spk)` the delta for both keychains.
+		todo!()
+	}
 
-    /// Register scripts that BDK revealed at index time (e.g. change outputs, which `create_tx`
-    /// only peeks) with the chain source's watch set. No-op for non-CBF backends.
-    fn register_revealed_scripts(&self, _locked_wallet: &PersistedWallet<KVStoreWalletPersister>) {
-        // TODO(cbf): diff `last_revealed_index(keychain)` against a per-keychain cursor and
-        // `chain_source.register_script(spk)` the delta for both keychains.
-        todo!()
-    }
-
-    fn update_payment_store<'a>(
+	fn update_payment_store<'a>(
 		&self, locked_wallet: &'a mut PersistedWallet<KVStoreWalletPersister>,
 		mut events: Vec<WalletEvent>,
 	) -> Result<(), Error> {
@@ -507,7 +506,7 @@ impl Wallet {
 			log_error!(self.logger, "Failed to persist wallet: {}", e);
 			Error::PersistenceFailed
 		})?;
-        self.chain_source.register_script(address_info.script_pubkey());
+		self.chain_source.register_script(address_info.script_pubkey());
 		Ok(address_info.address)
 	}
 
@@ -520,7 +519,7 @@ impl Wallet {
 			log_error!(self.logger, "Failed to persist wallet: {}", e);
 			Error::PersistenceFailed
 		})?;
-        self.chain_source.register_script(address_info.script_pubkey());
+		self.chain_source.register_script(address_info.script_pubkey());
 		Ok(address_info.address)
 	}
 
@@ -1097,7 +1096,7 @@ impl Wallet {
 			log_error!(self.logger, "Failed to persist wallet: {}", e);
 			()
 		})?;
-        self.chain_source.register_script(address_info.script_pubkey());
+		self.chain_source.register_script(address_info.script_pubkey());
 		Ok(address_info.address.script_pubkey())
 	}
 

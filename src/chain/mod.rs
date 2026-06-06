@@ -261,13 +261,12 @@ impl ChainSource {
 		}
 	}
 
-      pub(crate) fn register_script(&self, script: ScriptBuf) {
-      match &self.kind {
-          ChainSourceKind::Cbf(cbf) => cbf.register_script(script),
-          _ => {} // no-op: Esplora/Electrum/bitcoind don't need a watch set
-      }
-  }
-
+	pub(crate) fn register_script(&self, script: ScriptBuf) {
+		match &self.kind {
+			ChainSourceKind::Cbf(cbf) => cbf.register_script(script),
+			_ => {}, // no-op: Esplora/Electrum/bitcoind don't need a watch set
+		}
+	}
 
 	pub(crate) fn registered_txids(&self) -> Vec<Txid> {
 		self.registered_txids.lock().expect("lock").clone()
@@ -346,13 +345,14 @@ impl ChainSource {
 					.await
 			},
 			ChainSourceKind::Cbf(cbf_chain_source) => {
-				cbf_chain_source.process_kyoto_events(
-					stop_sync_receiver,
-					onchain_wallet,
-					channel_manager,
-					chain_monitor,
-					output_sweeper,
-				);
+				todo!();
+				// cbf_chain_source.process_kyoto_events(
+				// 	stop_sync_receiver,
+				// 	onchain_wallet,
+				// 	channel_manager,
+				// 	chain_monitor,
+				// 	output_sweeper,
+				// );
 			},
 		}
 	}

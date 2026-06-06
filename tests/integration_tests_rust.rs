@@ -24,7 +24,7 @@ use common::{
 	generate_listening_addresses, open_channel, open_channel_push_amt, open_channel_with_all,
 	premine_and_distribute_funds, premine_blocks, prepare_rbf, random_chain_source, random_config,
 	setup_bitcoind_and_electrsd, setup_builder, setup_node, setup_two_nodes, splice_in_with_all,
-	wait_for_tx, wait_for_node_tip, TestChainSource, TestStoreType, TestSyncStore,
+	wait_for_node_tip, wait_for_tx, TestChainSource, TestStoreType, TestSyncStore,
 };
 use electrsd::corepc_node::Node as BitcoinD;
 use electrsd::ElectrsD;
@@ -427,8 +427,8 @@ async fn onchain_send_receive() {
 	let new_height = generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-        wait_for_node_tip(&node_a, new_height).await;
-        wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 	expect_channel_ready_event!(node_a, node_b.node_id());
 	expect_channel_ready_event!(node_b, node_a.node_id());
 
@@ -497,8 +497,8 @@ async fn onchain_send_receive() {
 	let new_height = generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-        wait_for_node_tip(&node_a, new_height).await;
-        wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 
 	let expected_node_a_balance = expected_node_a_balance + amount_to_send_sats;
 	let expected_node_b_balance_lower = expected_node_b_balance_lower - amount_to_send_sats;
@@ -538,8 +538,8 @@ async fn onchain_send_receive() {
 	wait_for_tx(&electrsd.client, txid).await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-    wait_for_node_tip(&node_a, new_height).await;
-    wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 	let expected_node_b_balance_lower = expected_node_b_balance_lower + expected_node_a_balance;
 	let expected_node_b_balance_upper = expected_node_b_balance_upper + expected_node_a_balance;
 	let expected_node_a_balance = 0;
@@ -562,8 +562,8 @@ async fn onchain_send_receive() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-    wait_for_node_tip(&node_a, new_height).await;
-    wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 
 	let expected_node_b_balance_lower = expected_node_b_balance_lower + reserve_amount_sat;
 	let expected_node_b_balance_upper = expected_node_b_balance_upper + reserve_amount_sat;
@@ -615,8 +615,8 @@ async fn onchain_send_all_retains_reserve() {
 	let new_height = generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-    wait_for_node_tip(&node_a, new_height).await;
-    wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 	// Check node a sent all and node b received it
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, 0);
 	assert!(((premine_amount_sat * 2 - onchain_fee_buffer_sat)..=(premine_amount_sat * 2))
@@ -634,8 +634,8 @@ async fn onchain_send_all_retains_reserve() {
 	let new_height = generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-    wait_for_node_tip(&node_a, new_height).await;
-    wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 	assert_eq!(node_a.list_balances().spendable_onchain_balance_sats, reserve_amount_sat);
 
 	// Open a channel.
@@ -643,8 +643,8 @@ async fn onchain_send_all_retains_reserve() {
 	let new_height = generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-    wait_for_node_tip(&node_a, new_height).await;
-    wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 	expect_channel_ready_event!(node_a, node_b.node_id());
 	expect_channel_ready_event!(node_b, node_a.node_id());
 
@@ -662,8 +662,8 @@ async fn onchain_send_all_retains_reserve() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-    wait_for_node_tip(&node_a, new_height).await;
-    wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 
 	// Check node b sent all and node a received it
 	assert_eq!(node_b.list_balances().total_onchain_balance_sats, reserve_amount_sat);
@@ -710,7 +710,7 @@ async fn onchain_wallet_recovery() {
 
 	let new_height = generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
 	original_node.sync_wallets().unwrap();
-    wait_for_node_tip(&original_node, new_height).await;
+	wait_for_node_tip(&original_node, new_height).await;
 	assert_eq!(
 		original_node.list_balances().spendable_onchain_balance_sats,
 		premine_amount_sat * 2
@@ -748,7 +748,7 @@ async fn onchain_wallet_recovery() {
 
 	let new_height = generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
 	recovered_node.sync_wallets().unwrap();
-    wait_for_node_tip(&recovered_node, new_height).await;
+	wait_for_node_tip(&recovered_node, new_height).await;
 	assert_eq!(
 		recovered_node.list_balances().spendable_onchain_balance_sats,
 		premine_amount_sat * 3
@@ -1030,8 +1030,8 @@ async fn splice_channel() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-    wait_for_node_tip(&node_a, new_height).await;
-    wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 
 	let user_channel_id_a = expect_channel_ready_event!(node_a, node_b.node_id());
 	let user_channel_id_b = expect_channel_ready_event!(node_b, node_a.node_id());
@@ -1073,7 +1073,7 @@ async fn splice_channel() {
 	let txo = expect_splice_negotiated_event!(node_a, node_b.node_id());
 	expect_splice_negotiated_event!(node_b, node_a.node_id());
 
-	 generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
@@ -1114,8 +1114,8 @@ async fn splice_channel() {
 
 	// Mine a block to give time for the HTLC to resolve
 	let new_height = generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
-    wait_for_node_tip(&node_a, new_height).await;
-    wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 
 	assert_eq!(
 		node_a.list_balances().total_lightning_balance_sats,
@@ -1181,8 +1181,8 @@ async fn simple_bolt12_send_receive() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-    wait_for_node_tip(&node_a, new_height).await;
-    wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 
 	expect_channel_ready_event!(node_a, node_b.node_id());
 	expect_channel_ready_event!(node_b, node_a.node_id());
@@ -1470,10 +1470,10 @@ async fn async_payment() {
 	node_sender_lsp.sync_wallets().unwrap();
 	node_receiver_lsp.sync_wallets().unwrap();
 	node_receiver.sync_wallets().unwrap();
-    wait_for_node_tip(&node_sender, new_height).await;
-    wait_for_node_tip(&node_sender_lsp, new_height).await;
-    wait_for_node_tip(&node_receiver_lsp, new_height).await;
-    wait_for_node_tip(&node_receiver, new_height).await;
+	wait_for_node_tip(&node_sender, new_height).await;
+	wait_for_node_tip(&node_sender_lsp, new_height).await;
+	wait_for_node_tip(&node_receiver_lsp, new_height).await;
+	wait_for_node_tip(&node_receiver, new_height).await;
 
 	expect_channel_ready_event!(node_sender, node_sender_lsp.node_id());
 	expect_channel_ready_events!(
@@ -1668,8 +1668,8 @@ async fn generate_bip21_uri() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-    wait_for_node_tip(&node_a, new_height).await;
-    wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 
 	expect_channel_ready_event!(node_a, node_b.node_id());
 	expect_channel_ready_event!(node_b, node_a.node_id());
@@ -1710,8 +1710,8 @@ async fn unified_send_receive_bip21_uri() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-    wait_for_node_tip(&node_a, new_height).await;
-    wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 
 	expect_channel_ready_event!(node_a, node_b.node_id());
 	expect_channel_ready_event!(node_b, node_a.node_id());
@@ -1795,8 +1795,8 @@ async fn unified_send_receive_bip21_uri() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-    wait_for_node_tip(&node_a, new_height).await;
-    wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 
 	assert_eq!(node_b.list_balances().total_onchain_balance_sats, 800_000);
 	assert_eq!(node_b.list_balances().total_lightning_balance_sats, 200_000);
@@ -2070,8 +2070,8 @@ async fn spontaneous_send_with_custom_preimage() {
 	let new_height = generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-    wait_for_node_tip(&node_a, new_height).await;
-    wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 	expect_channel_ready_event!(node_a, node_b.node_id());
 	expect_channel_ready_event!(node_b, node_a.node_id());
 
@@ -2282,8 +2282,8 @@ async fn lsps2_client_trusts_lsp() {
 	let new_height = generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	service_node.sync_wallets().unwrap();
 	client_node.sync_wallets().unwrap();
-    wait_for_node_tip(&service_node, new_height).await;
-    wait_for_node_tip(&payer_node, new_height).await;
+	wait_for_node_tip(&service_node, new_height).await;
+	wait_for_node_tip(&payer_node, new_height).await;
 	assert_eq!(
 		client_node
 			.list_channels()
@@ -2378,8 +2378,8 @@ async fn lsps2_lsp_trusts_client_but_client_does_not_claim() {
 	let new_height = generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	service_node.sync_wallets().unwrap();
 	payer_node.sync_wallets().unwrap();
-    wait_for_node_tip(&service_node, new_height).await;
-    wait_for_node_tip(&payer_node, new_height).await;
+	wait_for_node_tip(&service_node, new_height).await;
+	wait_for_node_tip(&payer_node, new_height).await;
 	expect_channel_ready_event!(payer_node, service_node.node_id());
 	expect_channel_ready_event!(service_node, payer_node.node_id());
 
@@ -2415,8 +2415,8 @@ async fn lsps2_lsp_trusts_client_but_client_does_not_claim() {
 	let new_height = generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	service_node.sync_wallets().unwrap();
 	client_node.sync_wallets().unwrap();
-        wait_for_node_tip(&service_node, new_height).await;
-        wait_for_node_tip(&client_node, new_height).await;
+	wait_for_node_tip(&service_node, new_height).await;
+	wait_for_node_tip(&client_node, new_height).await;
 	assert_eq!(
 		client_node
 			.list_channels()
@@ -2480,8 +2480,8 @@ async fn payment_persistence_after_restart() {
 		let new_height = generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 		node_a.sync_wallets().unwrap();
 		node_b.sync_wallets().unwrap();
-        wait_for_node_tip(&node_a, new_height).await;
-        wait_for_node_tip(&node_b, new_height).await;
+		wait_for_node_tip(&node_a, new_height).await;
+		wait_for_node_tip(&node_b, new_height).await;
 		expect_channel_ready_event!(node_a, node_b.node_id());
 		expect_channel_ready_event!(node_b, node_a.node_id());
 
@@ -2794,8 +2794,8 @@ async fn onchain_fee_bump_rbf() {
 	let new_height = generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-        wait_for_node_tip(&node_a, new_height).await;
-        wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 
 	assert_eq!(
 		Err(NodeError::InvalidPaymentId),
@@ -2859,8 +2859,8 @@ async fn open_channel_with_all_with_anchors() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-        wait_for_node_tip(&node_a, new_height).await;
-        wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 
 	let _user_channel_id_a = expect_channel_ready_event!(node_a, node_b.node_id());
 	let _user_channel_id_b = expect_channel_ready_event!(node_b, node_a.node_id());
@@ -2914,8 +2914,8 @@ async fn open_channel_with_all_without_anchors() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-        wait_for_node_tip(&node_a, new_height).await;
-        wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 
 	let _user_channel_id_a = expect_channel_ready_event!(node_a, node_b.node_id());
 	let _user_channel_id_b = expect_channel_ready_event!(node_b, node_a.node_id());
@@ -2969,8 +2969,8 @@ async fn splice_in_with_all_balance() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-        wait_for_node_tip(&node_a, new_height).await;
-        wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 
 	let user_channel_id_a = expect_channel_ready_event!(node_a, node_b.node_id());
 	let _user_channel_id_b = expect_channel_ready_event!(node_b, node_a.node_id());
@@ -2990,8 +2990,8 @@ async fn splice_in_with_all_balance() {
 
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
-        wait_for_node_tip(&node_a, new_height).await;
-        wait_for_node_tip(&node_b, new_height).await;
+	wait_for_node_tip(&node_a, new_height).await;
+	wait_for_node_tip(&node_b, new_height).await;
 
 	let _user_channel_id_a2 = expect_channel_ready_event!(node_a, node_b.node_id());
 	let _user_channel_id_b2 = expect_channel_ready_event!(node_b, node_a.node_id());
