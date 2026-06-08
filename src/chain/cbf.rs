@@ -248,6 +248,7 @@ impl CbfChainSource {
 				match current_node.run().await {
 					Ok(()) => {
 						log_info!(restart_logger, "CBF node shut down cleanly.");
+						*restart_status.lock().expect("lock") = CbfRuntimeStatus::Stopped;
 						break;
 					},
 					Err(e) => {
@@ -292,8 +293,18 @@ impl CbfChainSource {
 							event_rx: new_event_rx,
 						} = new_client;
 
-						*restart_status.lock().expect("lock") =
-							CbfRuntimeStatus::Started { requester: new_requester };
+						{
+							let mut status = restart_status.lock().expect("lock");
+							if matches!(*status, CbfRuntimeStatus::Stopped) {
+								let _ = new_requester.shutdown();
+								log_info!(
+									restart_logger,
+									"CBF restart aborted: stop() called during backoff."
+								);
+								break;
+							}
+							*status = CbfRuntimeStatus::Started { requester: new_requester };
+						}
 
 						current_node = new_node;
 						current_info_rx = new_info_rx;
@@ -306,7 +317,23 @@ impl CbfChainSource {
 	}
 
 	pub(crate) fn stop(&self) {
-		todo!();
+		let requester = {
+			let mut status = self.cbf_runtime_status.lock().expect("lock");
+			match &*status {
+				CbfRuntimeStatus::Started { requester } => {
+					let requester = requester.clone();
+					*status = CbfRuntimeStatus::Stopped;
+					Some(requester)
+				},
+				CbfRuntimeStatus::Stopped => None,
+			}
+		};
+
+		if let Some(requester) = requester {
+			if let Err(e) = requester.shutdown() {
+				log_error!(self.logger, "Failed to shut down CBF node: {:?}", e);
+			}
+		}
 	}
 
 	async fn process_info_messages(mut info_rx: mpsc::Receiver<Info>, logger: Arc<Logger>) {
