@@ -548,9 +548,9 @@ impl ChainSource {
 						ChainSourceKind::Bitcoind(bitcoind_chain_source) => {
 							bitcoind_chain_source.process_broadcast_package(txs).await
 						},
-						ChainSourceKind::Cbf { ..} => {
-							todo!();
-						}
+						ChainSourceKind::Cbf(cbf_chain_source) => {
+							cbf_chain_source.process_broadcast_package(next_package).await
+						},
 					}
 				}
 			}
