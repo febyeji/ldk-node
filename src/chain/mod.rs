@@ -202,7 +202,7 @@ impl ChainSource {
 	}
 
 	pub(crate) fn new_cbf(
-		peers: Vec<String>, fee_source_config: Option<CbfFeeSourceConfig>,
+		peers: Vec<String>, fee_source_config: Option<CbfFeeSourceConfig>, runtime: Arc<Runtime>,
 		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
 		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
 		node_metrics: Arc<RwLock<NodeMetrics>>,
@@ -210,8 +210,12 @@ impl ChainSource {
 		let cbf_chain_source = CbfChainSource::new(
 			peers,
 			fee_source_config,
+			runtime,
+			Arc::clone(&fee_estimator),
+			Arc::clone(&kv_store),
 			Arc::clone(&config),
 			Arc::clone(&logger),
+			Arc::clone(&node_metrics),
 		)?;
 		let kind = ChainSourceKind::Cbf(cbf_chain_source);
 		let registered_txids = Mutex::new(Vec::new());
@@ -234,7 +238,7 @@ impl ChainSource {
 					chain_monitor,
 					output_sweeper,
 				};
-				cbf_chain_source.start(runtime, chain_listener);
+				cbf_chain_source.start(chain_listener);
 			},
 			_ => {
 				// Nothing to do for other chain sources.
@@ -346,14 +350,9 @@ impl ChainSource {
 					.await
 			},
 			ChainSourceKind::Cbf(cbf_chain_source) => {
-				todo!();
-				// cbf_chain_source.process_kyoto_events(
-				// 	stop_sync_receiver,
-				// 	onchain_wallet,
-				// 	channel_manager,
-				// 	chain_monitor,
-				// 	output_sweeper,
-				// );
+				//CBF cannot run without background syncing, when the chain source is running, it
+				//syncs. Thus we don't have anything similar to other chain sources.
+				cbf_chain_source.continuously_update_fee_rate_estimates(stop_sync_receiver).await
 			},
 		}
 	}
@@ -510,8 +509,8 @@ impl ChainSource {
 			ChainSourceKind::Bitcoind(bitcoind_chain_source) => {
 				bitcoind_chain_source.update_fee_rate_estimates().await
 			},
-			ChainSourceKind::Cbf { .. } => {
-				todo!();
+			ChainSourceKind::Cbf(cbf_chain_source) => {
+				cbf_chain_source.update_fee_rate_estimates().await
 			},
 		}
 	}

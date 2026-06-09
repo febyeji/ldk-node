@@ -1,0 +1,33 @@
+// This file is Copyright its original authors, visible in version control history.
+//
+// This file is licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
+// accordance with one or both of these licenses.
+
+//! Miscellaneous pure helper functions.
+
+use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
+use bitcoin::{Amount, Block, FeeRate};
+
+/// Block subsidy at the given height (approximate on regtest).
+pub(crate) fn block_subsidy(height: u32) -> Amount {
+	let halvings = height / SUBSIDY_HALVING_INTERVAL;
+	if halvings >= 64 {
+		return Amount::ZERO;
+	}
+	Amount::from_sat((Amount::ONE_BTC.to_sat() * 50) >> halvings)
+}
+
+/// Average fee rate of a block, derived from its coinbase: `(coinbase output total - subsidy) /
+/// weight`. Lets us compute the fee rate of a block we already hold without a re-download.
+pub(crate) fn coinbase_fee_rate(block: &Block, height: u32) -> FeeRate {
+	let revenue: Amount = block
+		.txdata
+		.first()
+		.map(|coinbase| coinbase.output.iter().map(|txout| txout.value).sum())
+		.unwrap_or(Amount::ZERO);
+	let block_fees = revenue.checked_sub(block_subsidy(height)).unwrap_or(Amount::ZERO);
+	let fee_rate = block_fees.to_sat().checked_div(block.weight().to_kwu_floor()).unwrap_or(0);
+	FeeRate::from_sat_per_kwu(fee_rate)
+}
