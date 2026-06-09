@@ -27,7 +27,7 @@ use crate::io::utils::update_and_persist_node_metrics;
 use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use crate::runtime::Runtime;
 use crate::types::DynStore;
-use crate::util::coinbase_fee_rate;
+use crate::util::{cbf_percentile_for_target, coinbase_fee_rate, percentile_of_sorted};
 use crate::NodeMetrics;
 
 /// Walk back this many blocks from the wallet's persisted tip when deriving
@@ -753,32 +753,6 @@ impl CbfChainSource {
 		*cache.lock().expect("lock") = window;
 		samples
 	}
-}
-
-/// Maps a confirmation target to the percentile of the recent-block fee-rate window we read for it.
-///
-/// More urgent targets (shorter confirmation horizon) read a higher percentile; relaxed targets
-/// read a lower one. This is a coarse stand-in for the per-horizon estimates a mempool-aware
-/// backend would provide.
-fn cbf_percentile_for_target(target: ConfirmationTarget) -> f64 {
-	match get_num_block_defaults_for_target(target) {
-		0..=2 => 90.0,
-		3..=6 => 75.0,
-		7..=12 => 50.0,
-		13..=144 => 25.0,
-		_ => 10.0,
-	}
-}
-
-/// Returns the value at the given percentile of an ascending-sorted slice using nearest-rank.
-/// Returns `0` for an empty slice.
-fn percentile_of_sorted(sorted: &[u64], percentile: f64) -> u64 {
-	if sorted.is_empty() {
-		return 0;
-	}
-	let rank = ((percentile / 100.0) * sorted.len() as f64).ceil() as usize;
-	let idx = rank.saturating_sub(1).min(sorted.len() - 1);
-	sorted[idx]
 }
 
 fn resume_checkpoint(logger: &Logger, chain_listener: &ChainListener) -> Option<HashCheckpoint> {

@@ -10,6 +10,8 @@
 use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
 use bitcoin::{Amount, Block, FeeRate};
 
+use crate::fee_estimator::{get_num_block_defaults_for_target, ConfirmationTarget};
+
 /// Block subsidy at the given height (approximate on regtest).
 pub(crate) fn block_subsidy(height: u32) -> Amount {
 	let halvings = height / SUBSIDY_HALVING_INTERVAL;
@@ -30,4 +32,30 @@ pub(crate) fn coinbase_fee_rate(block: &Block, height: u32) -> FeeRate {
 	let block_fees = revenue.checked_sub(block_subsidy(height)).unwrap_or(Amount::ZERO);
 	let fee_rate = block_fees.to_sat().checked_div(block.weight().to_kwu_floor()).unwrap_or(0);
 	FeeRate::from_sat_per_kwu(fee_rate)
+}
+
+/// Maps a confirmation target to the percentile of the recent-block fee-rate window we read for it.
+///
+/// More urgent targets (shorter confirmation horizon) read a higher percentile; relaxed targets
+/// read a lower one. This is a coarse stand-in for the per-horizon estimates a mempool-aware
+/// backend would provide.
+pub(crate) fn cbf_percentile_for_target(target: ConfirmationTarget) -> f64 {
+	match get_num_block_defaults_for_target(target) {
+		0..=2 => 90.0,
+		3..=6 => 75.0,
+		7..=12 => 50.0,
+		13..=144 => 25.0,
+		_ => 10.0,
+	}
+}
+
+/// Returns the value at the given percentile of an ascending-sorted slice using nearest-rank.
+/// Returns `0` for an empty slice.
+pub(crate) fn percentile_of_sorted(sorted: &[u64], percentile: f64) -> u64 {
+	if sorted.is_empty() {
+		return 0;
+	}
+	let rank = ((percentile / 100.0) * sorted.len() as f64).ceil() as usize;
+	let idx = rank.saturating_sub(1).min(sorted.len() - 1);
+	sorted[idx]
 }
