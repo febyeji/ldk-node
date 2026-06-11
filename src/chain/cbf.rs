@@ -14,6 +14,7 @@ use lightning::chain::{BlockLocator, Listen, WatchedOutput};
 
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::wallet::{Wallet};
 use crate::chain::bitcoind::ChainListener;
 use crate::chain::electrum::get_electrum_fee_rate_cache_update;
 use crate::chain::CbfFeeSourceConfig;
@@ -64,6 +65,7 @@ enum CbfRuntimeStatus {
 pub struct CbfChainSource {
 	/// Trusted peer addresses for kyoto's `Builder::add_peers`.
 	trusted_peers: Vec<TrustedPeer>,
+    /// Scripts tracked by LDK, onchain wallet's scripts are pulled from the onchain wallet
 	registered_scripts: Arc<Mutex<HashSet<ScriptBuf>>>,
 	fee_source: FeeSource,
 	/// Tracks whether the kyoto node is running and holds the live requester.
@@ -242,11 +244,6 @@ impl CbfChainSource {
 	}
 
 	pub(crate) fn start(&self, chain_listener: ChainListener) {
-		//populate registered scripts with all the scripts from the onchain wallet
-		for script in chain_listener.onchain_wallet.list_revealed_scripts() {
-			self.register_script(script);
-		}
-
 		let (node, client) =
 			Self::build_kyoto(&self.trusted_peers, &self.config, &self.logger, &chain_listener);
 		let Client { requester, info_rx, warn_rx, event_rx } = client;
@@ -308,6 +305,7 @@ impl CbfChainSource {
 					Arc::clone(&restart_registered_scripts),
 					Arc::clone(&restart_cbf_runtime_status),
 					ops_tx.clone(),
+                    Arc::clone(&restart_listener.onchain_wallet),
 				));
 
 				match current_node.run().await {
@@ -419,6 +417,7 @@ impl CbfChainSource {
 		logger: Arc<Logger>, mut event_rx: mpsc::UnboundedReceiver<Event>,
 		registered_scripts: Arc<Mutex<HashSet<ScriptBuf>>>,
 		cbf_runtime_status: Arc<Mutex<CbfRuntimeStatus>>, ops_tx: mpsc::UnboundedSender<ChainOp>,
+        onchain_wallet: Arc<Wallet>
 	) {
 		while let Some(event) = event_rx.recv().await {
 			match event {
@@ -430,9 +429,16 @@ impl CbfChainSource {
 							continue;
 						},
 					};
+                    //registered_scripts contains only LDK scripts, not onchain wallet's scripts,
+                    //as don't want to track them twice: once in bdk, once in CbfChainSource, thus
+                    //each time we receive an IndexedFilter event, we ask bdk to give us all
+                    //revealed scripts. We create all_scripts starting from onchain wallet's
+                    //scripts and extend them with LDK's ones
+                    let mut all_scripts = onchain_wallet.list_revealed_scripts();
+                    all_scripts.extend(registered_scripts.lock().expect("lock").iter().cloned());
+
 					let block_hash = indexed_filter.block_hash();
-					let matched = indexed_filter
-						.contains_any(registered_scripts.lock().expect("lock").iter());
+					let matched = indexed_filter.contains_any(all_scripts.iter());
 
 					let chop: ChainOp = if matched {
 						let block_rx =
@@ -521,9 +527,9 @@ impl CbfChainSource {
 		self.registered_scripts.lock().expect("lock").insert(output.script_pubkey);
 	}
 
-	pub(crate) fn register_script(&self, script: ScriptBuf) {
-		self.registered_scripts.lock().expect("lock").insert(script);
-	}
+	// pub(crate) fn register_script(&self, script: ScriptBuf) {
+	// 	self.registered_scripts.lock().expect("lock").insert(script);
+	// }
 
 	pub(crate) async fn continuously_update_fee_rate_estimates(
 		&self, mut stop_sync_receiver: watch::Receiver<()>,

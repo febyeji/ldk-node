@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use bitcoin::{Script, ScriptBuf, Txid};
+use bitcoin::{Script, Txid};
 use lightning::chain::{BlockLocator, Filter};
 
 use crate::chain::bitcoind::{BitcoindChainSource, ChainListener, UtxoSourceClient};
@@ -263,13 +263,6 @@ impl ChainSource {
 				Some(bitcoind_chain_source.as_utxo_source())
 			},
 			_ => None,
-		}
-	}
-
-	pub(crate) fn register_script(&self, script: ScriptBuf) {
-		match &self.kind {
-			ChainSourceKind::Cbf(cbf) => cbf.register_script(script),
-			_ => {}, // no-op: Esplora/Electrum/bitcoind don't need a watch set
 		}
 	}
 
