@@ -486,6 +486,7 @@ impl ChainSource {
 					.await
 			},
 			ChainSourceKind::Cbf { .. } => {
+				return Ok(());
 				todo!();
 			},
 		}
