@@ -15,7 +15,6 @@ use lightning::chain::{BlockLocator, Listen, WatchedOutput};
 
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::wallet::{Wallet};
 use crate::chain::bitcoind::ChainListener;
 use crate::chain::electrum::get_electrum_fee_rate_cache_update;
 use crate::chain::CbfFeeSourceConfig;
@@ -30,6 +29,7 @@ use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger
 use crate::runtime::Runtime;
 use crate::types::DynStore;
 use crate::util::{cbf_percentile_for_target, coinbase_fee_rate, percentile_of_sorted};
+use crate::wallet::Wallet;
 use crate::PersistedNodeMetrics;
 
 /// Walk back this many blocks from the wallet's persisted tip when deriving
@@ -66,7 +66,7 @@ enum CbfRuntimeStatus {
 pub struct CbfChainSource {
 	/// Trusted peer addresses for kyoto's `Builder::add_peers`.
 	trusted_peers: Vec<TrustedPeer>,
-    /// Scripts tracked by LDK, onchain wallet's scripts are pulled from the onchain wallet
+	/// Scripts tracked by LDK, onchain wallet's scripts are pulled from the onchain wallet
 	registered_scripts: Arc<Mutex<HashSet<ScriptBuf>>>,
 	fee_source: FeeSource,
 	/// Tracks whether the kyoto node is running and holds the live requester.
@@ -101,6 +101,7 @@ enum ChainOp {
 struct BlockApplicator {
 	chain_listener: ChainListener,
 	ops_rx: mpsc::UnboundedReceiver<ChainOp>,
+	next_height: u32,
 	/// Present only for the native CBF fee source: lets us cache the fee rate of blocks we download
 	/// here, so the fee estimator doesn't have to re-download them.
 	block_fee_cache: Option<BlockFeeCache>,
@@ -113,7 +114,17 @@ impl BlockApplicator {
 			match op {
 				ChainOp::ConnectFull { block_rx } => match block_rx.await {
 					Ok(Ok(ib)) => {
+						if ib.height != self.next_height {
+							log_debug!(
+								self.logger,
+								"CBF skipping out-of-sequence block at height {} (expected {})",
+								ib.height,
+								self.next_height
+							);
+							continue;
+						}
 						self.chain_listener.block_connected(&ib.block, ib.height);
+						self.next_height += 1;
 						if let Some(cache) = &self.block_fee_cache {
 							let fee_rate = coinbase_fee_rate(&ib.block, ib.height);
 							cache
@@ -126,10 +137,21 @@ impl BlockApplicator {
 					Err(_) => log_error!(self.logger, "block oneshot dropped"),
 				},
 				ChainOp::ConnectFiltered { header, height } => {
+					if height != self.next_height {
+						log_debug!(
+							self.logger,
+							"CBF skipping out-of-sequence block at height {} (expected {})",
+							height,
+							self.next_height
+						);
+						continue;
+					}
 					self.chain_listener.filtered_block_connected(&header, &[], height);
+					self.next_height += 1;
 				},
 				ChainOp::Disconnect { fork_point } => {
 					self.chain_listener.blocks_disconnected(fork_point);
+					self.next_height = fork_point.height + 1;
 				},
 				ChainOp::Synced { tip_height } => {
 					log_info!(self.logger, "CBF caught up to tip {}", tip_height);
@@ -264,6 +286,7 @@ impl CbfChainSource {
 			_ => None,
 		};
 		let block_applicator = BlockApplicator {
+			next_height: chain_listener.get_best_block().height + 1,
 			chain_listener: chain_listener.clone(),
 			ops_rx,
 			block_fee_cache,
@@ -306,7 +329,7 @@ impl CbfChainSource {
 					Arc::clone(&restart_registered_scripts),
 					Arc::clone(&restart_cbf_runtime_status),
 					ops_tx.clone(),
-                    Arc::clone(&restart_listener.onchain_wallet),
+					Arc::clone(&restart_listener.onchain_wallet),
 				));
 
 				match current_node.run().await {
@@ -336,14 +359,13 @@ impl CbfChainSource {
 							backoff_ms,
 						);
 
-						tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-						backoff_ms = backoff_ms.saturating_mul(2);
-
 						// Abort the old log consumers before rebuilding.
 						info_handle.abort();
 						warn_handle.abort();
 						event_handle.abort();
 
+						tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+						backoff_ms = backoff_ms.saturating_mul(2);
 						let (new_node, new_client) = Self::build_kyoto(
 							&restart_peers,
 							&restart_config,
@@ -418,7 +440,7 @@ impl CbfChainSource {
 		logger: Arc<Logger>, mut event_rx: mpsc::UnboundedReceiver<Event>,
 		registered_scripts: Arc<Mutex<HashSet<ScriptBuf>>>,
 		cbf_runtime_status: Arc<Mutex<CbfRuntimeStatus>>, ops_tx: mpsc::UnboundedSender<ChainOp>,
-        onchain_wallet: Arc<Wallet>
+		onchain_wallet: Arc<Wallet>,
 	) {
 		while let Some(event) = event_rx.recv().await {
 			match event {
@@ -430,21 +452,23 @@ impl CbfChainSource {
 							continue;
 						},
 					};
-                    //registered_scripts contains only LDK scripts, not onchain wallet's scripts,
-                    //as don't want to track them twice: once in bdk, once in CbfChainSource, thus
-                    //each time we receive an IndexedFilter event, we ask bdk to give us all
-                    //revealed scripts. We create all_scripts starting from onchain wallet's
-                    //scripts and extend them with LDK's ones
-                    let mut all_scripts = onchain_wallet.list_revealed_scripts();
-                    all_scripts.extend(registered_scripts.lock().expect("lock").iter().cloned());
+					//registered_scripts contains only LDK scripts, not onchain wallet's scripts,
+					//as don't want to track them twice: once in bdk, once in CbfChainSource, thus
+					//each time we receive an IndexedFilter event, we ask bdk to give us all
+					//revealed scripts. We create all_scripts starting from onchain wallet's
+					//scripts and extend them with LDK's ones
+					let mut all_scripts = onchain_wallet.list_revealed_scripts();
+					all_scripts.extend(registered_scripts.lock().expect("lock").iter().cloned());
 
 					let block_hash = indexed_filter.block_hash();
 					let matched = indexed_filter.contains_any(all_scripts.iter());
 
 					let chop: ChainOp = if matched {
-						let block_rx =
-							requester.request_block(block_hash).expect("cannot request block");
-						ChainOp::ConnectFull { block_rx }
+						if let Ok(handle) = requester.request_block(block_hash) {
+							ChainOp::ConnectFull { block_rx: handle }
+						} else {
+							break;
+						}
 					} else {
 						let height = indexed_filter.height();
 						//TODO we need to recheck that a particular height has not been
@@ -468,6 +492,8 @@ impl CbfChainSource {
 								}
 							},
 							Ok(None) => {
+								//TODO what do we do?
+								todo!();
 								log_error!(logger, "No header at height {}", height,);
 								continue;
 							},
@@ -478,7 +504,8 @@ impl CbfChainSource {
 									height,
 									e,
 								);
-								continue;
+								break;
+								// continue;
 							},
 						}
 					};
