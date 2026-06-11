@@ -24,9 +24,8 @@ use common::{
 	generate_listening_addresses, invalidate_blocks, open_channel, open_channel_push_amt,
 	open_channel_with_all, premine_and_distribute_funds, premine_blocks, prepare_rbf,
 	random_chain_source, random_config, setup_bitcoind_and_electrsd, setup_builder, setup_node,
-	setup_two_nodes, splice_in_with_all, wait_for_block, wait_for_tx, TestChainSource, TestConfig,
-	TestStoreType, TestSyncStore,
-	wait_for_node_tip,
+	setup_two_nodes, splice_in_with_all, wait_for_block, wait_for_node_tip, wait_for_tx,
+	TestChainSource, TestConfig, TestStoreType, TestSyncStore,
 };
 use electrsd::corepc_node::{self, Node as BitcoinD};
 use electrsd::ElectrsD;
@@ -2873,6 +2872,8 @@ async fn do_lsps2_client_service_integration(client_trusts_lsp: bool) {
 	let new_height = generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	service_node.sync_wallets().unwrap();
 	payer_node.sync_wallets().unwrap();
+	wait_for_node_tip(&service_node, new_height).await;
+	wait_for_node_tip(&payer_node, new_height).await;
 	expect_channel_ready_event!(payer_node, service_node.node_id());
 	expect_channel_ready_event!(service_node, payer_node.node_id());
 
