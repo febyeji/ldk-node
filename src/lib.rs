@@ -105,6 +105,7 @@ mod runtime;
 mod scoring;
 mod tx_broadcaster;
 mod types;
+mod util;
 mod wallet;
 
 use std::default::Default;
