@@ -827,7 +827,6 @@ pub(crate) async fn wait_for_outpoint_spend<E: ElectrumApi>(electrs: &E, outpoin
 	.await;
 }
 
-<<<<<<< HEAD
 /// Polls the channel from `source_node` to `counterparty_node` until it reports `is_usable`
 /// and can carry an HTLC of `min_amount_msat` from `source_node`'s side.
 ///

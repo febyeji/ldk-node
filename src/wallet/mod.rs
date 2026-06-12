@@ -36,7 +36,7 @@ use lightning::chain::chaininterface::{
 	INCREMENTAL_RELAY_FEE_SAT_PER_1000_WEIGHT,
 };
 use lightning::chain::channelmonitor::ANTI_REORG_DELAY;
-use lightning::chain::{BlockLocator, ClaimId, Filter, Listen};
+use lightning::chain::{BlockLocator, ClaimId, Listen};
 use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::inbound_payment::ExpandedKey;
 use lightning::ln::msgs::UnsignedGossipMessage;
@@ -537,7 +537,6 @@ impl Wallet {
 			log_error!(self.logger, "Failed to persist wallet: {}", e);
 			Error::PersistenceFailed
 		})?;
-		self.chain_source.register_script(address_info.script_pubkey());
 		Ok(address_info.address)
 	}
 
@@ -552,7 +551,6 @@ impl Wallet {
 			log_error!(self.logger, "Failed to persist wallet: {}", e);
 			Error::PersistenceFailed
 		})?;
-		self.chain_source.register_script(address_info.script_pubkey());
 		Ok(address_info.address)
 	}
 
@@ -1150,7 +1148,6 @@ impl Wallet {
 		locked_persister.persist_changeset(change_set).await.map_err(|e| {
 			log_error!(self.logger, "Failed to persist wallet: {}", e);
 		})?;
-		self.chain_source.register_script(address_info.script_pubkey());
 		Ok(address_info.address.script_pubkey())
 	}
 
