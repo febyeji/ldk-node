@@ -717,6 +717,9 @@ pub(crate) async fn wait_for_outpoint_spend<E: ElectrumApi>(electrs: &E, outpoin
 
 pub(crate) async fn wait_for_node_tip(node: &Node, height: usize) {
 	exponential_backoff_poll(|| {
+		if (node.status().current_best_block.height as usize) < height {
+			let _ = node.sync_wallets();
+		}
 		(node.status().current_best_block.height as usize >= height).then_some(())
 	})
 	.await;

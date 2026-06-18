@@ -98,10 +98,16 @@ enum ChainOp {
 	},
 }
 
+enum PendingBlock {
+	Full(IndexedBlock),
+	Filtered(Header),
+}
+
 struct BlockApplicator {
 	chain_listener: ChainListener,
 	ops_rx: mpsc::UnboundedReceiver<ChainOp>,
 	next_height: u32,
+	pending: BTreeMap<u32, PendingBlock>,
 	/// Present only for the native CBF fee source: lets us cache the fee rate of blocks we download
 	/// here, so the fee estimator doesn't have to re-download them.
 	block_fee_cache: Option<BlockFeeCache>,
@@ -114,44 +120,18 @@ impl BlockApplicator {
 			match op {
 				ChainOp::ConnectFull { block_rx } => match block_rx.await {
 					Ok(Ok(ib)) => {
-						if ib.height != self.next_height {
-							log_debug!(
-								self.logger,
-								"CBF skipping out-of-sequence block at height {} (expected {})",
-								ib.height,
-								self.next_height
-							);
-							continue;
-						}
-						self.chain_listener.block_connected(&ib.block, ib.height);
-						self.next_height += 1;
-						if let Some(cache) = &self.block_fee_cache {
-							let fee_rate = coinbase_fee_rate(&ib.block, ib.height);
-							cache
-								.lock()
-								.expect("lock")
-								.insert(ib.height, (ib.block.block_hash(), fee_rate));
-						}
+						self.queue_block(ib.height, PendingBlock::Full(ib));
 					},
 					Ok(Err(e)) => log_error!(self.logger, "block fetch failed: {:?}", e),
 					Err(_) => log_error!(self.logger, "block oneshot dropped"),
 				},
 				ChainOp::ConnectFiltered { header, height } => {
-					if height != self.next_height {
-						log_debug!(
-							self.logger,
-							"CBF skipping out-of-sequence block at height {} (expected {})",
-							height,
-							self.next_height
-						);
-						continue;
-					}
-					self.chain_listener.filtered_block_connected(&header, &[], height);
-					self.next_height += 1;
+					self.queue_block(height, PendingBlock::Filtered(header));
 				},
 				ChainOp::Disconnect { fork_point } => {
 					self.chain_listener.blocks_disconnected(fork_point);
 					self.next_height = fork_point.height + 1;
+					self.pending.clear();
 				},
 				ChainOp::Synced { tip_height } => {
 					log_info!(self.logger, "CBF caught up to tip {}", tip_height);
@@ -159,6 +139,49 @@ impl BlockApplicator {
 					// a notification primitive is plumbed through.
 				},
 			}
+		}
+	}
+
+	fn queue_block(&mut self, height: u32, block: PendingBlock) {
+		if height < self.next_height {
+			log_debug!(
+				self.logger,
+				"CBF skipping stale block at height {} (expected {})",
+				height,
+				self.next_height
+			);
+			return;
+		}
+		if height > self.next_height {
+			log_debug!(
+				self.logger,
+				"CBF buffering out-of-sequence block at height {} (expected {})",
+				height,
+				self.next_height
+			);
+		}
+		self.pending.insert(height, block);
+		self.apply_pending_blocks();
+	}
+
+	fn apply_pending_blocks(&mut self) {
+		while let Some(block) = self.pending.remove(&self.next_height) {
+			match block {
+				PendingBlock::Full(ib) => {
+					self.chain_listener.block_connected(&ib.block, ib.height);
+					if let Some(cache) = &self.block_fee_cache {
+						let fee_rate = coinbase_fee_rate(&ib.block, ib.height);
+						cache
+							.lock()
+							.expect("lock")
+							.insert(ib.height, (ib.block.block_hash(), fee_rate));
+					}
+				},
+				PendingBlock::Filtered(header) => {
+					self.chain_listener.filtered_block_connected(&header, &[], self.next_height);
+				},
+			}
+			self.next_height += 1;
 		}
 	}
 }
@@ -287,6 +310,7 @@ impl CbfChainSource {
 		};
 		let block_applicator = BlockApplicator {
 			next_height: chain_listener.get_best_block().height + 1,
+			pending: BTreeMap::new(),
 			chain_listener: chain_listener.clone(),
 			ops_rx,
 			block_fee_cache,
@@ -646,10 +670,7 @@ impl CbfChainSource {
 				.await?
 			},
 			FeeSource::Cbf { block_fee_cache } => {
-				let requester = match &*self.cbf_runtime_status.lock().expect("lock") {
-					CbfRuntimeStatus::Started { requester } => requester.clone(),
-					CbfRuntimeStatus::Stopped => return Err(Error::FeerateEstimationUpdateFailed),
-				};
+				let requester = self.requester()?;
 				let mut samples_sat_per_kwu: Vec<u64> = self
 					.refresh_block_fee_window(&requester, block_fee_cache)
 					.await
@@ -693,12 +714,9 @@ impl CbfChainSource {
 	}
 
 	pub(crate) async fn process_broadcast_package(&self, package: Vec<Transaction>) {
-		let requester = match &*self.cbf_runtime_status.lock().expect("lock") {
-			CbfRuntimeStatus::Started { requester } => requester.clone(),
-			CbfRuntimeStatus::Stopped => {
-				debug_assert!(false, "We should have started the chain source before broadcasting");
-				return;
-			},
+		let requester = match self.requester() {
+			Ok(requester) => requester,
+			Err(_) => return,
 		};
 
 		match Package::from_vec(package.clone()) {
@@ -719,6 +737,20 @@ impl CbfChainSource {
 						);
 					}
 				}
+			},
+		}
+	}
+
+	/// Returns a clone of the live kyoto requester, or an error if the node isn't running.
+	fn requester(&self) -> Result<Requester, Error> {
+		match &*self.cbf_runtime_status.lock().expect("lock") {
+			CbfRuntimeStatus::Started { requester } => Ok(requester.clone()),
+			CbfRuntimeStatus::Stopped => {
+				debug_assert!(
+					false,
+					"We should have started the chain source before using the requester"
+				);
+				Err(Error::FeerateEstimationUpdateFailed)
 			},
 		}
 	}
