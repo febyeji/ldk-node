@@ -15,7 +15,6 @@ use lightning::chain::{BlockLocator, Listen, WatchedOutput};
 
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::wallet::{Wallet};
 use crate::chain::bitcoind::ChainListener;
 use crate::chain::electrum::get_electrum_fee_rate_cache_update;
 use crate::chain::CbfFeeSourceConfig;
@@ -30,6 +29,7 @@ use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger
 use crate::runtime::Runtime;
 use crate::types::DynStore;
 use crate::util::{cbf_percentile_for_target, coinbase_fee_rate, percentile_of_sorted};
+use crate::wallet::Wallet;
 use crate::NodeMetrics;
 
 /// Walk back this many blocks from the wallet's persisted tip when deriving
@@ -66,7 +66,7 @@ enum CbfRuntimeStatus {
 pub struct CbfChainSource {
 	/// Trusted peer addresses for kyoto's `Builder::add_peers`.
 	trusted_peers: Vec<TrustedPeer>,
-    /// Scripts tracked by LDK, onchain wallet's scripts are pulled from the onchain wallet
+	/// Scripts tracked by LDK, onchain wallet's scripts are pulled from the onchain wallet
 	registered_scripts: Arc<Mutex<HashSet<ScriptBuf>>>,
 	fee_source: FeeSource,
 	/// Tracks whether the kyoto node is running and holds the live requester.
@@ -306,7 +306,7 @@ impl CbfChainSource {
 					Arc::clone(&restart_registered_scripts),
 					Arc::clone(&restart_cbf_runtime_status),
 					ops_tx.clone(),
-                    Arc::clone(&restart_listener.onchain_wallet),
+					Arc::clone(&restart_listener.onchain_wallet),
 				));
 
 				match current_node.run().await {
@@ -418,7 +418,7 @@ impl CbfChainSource {
 		logger: Arc<Logger>, mut event_rx: mpsc::UnboundedReceiver<Event>,
 		registered_scripts: Arc<Mutex<HashSet<ScriptBuf>>>,
 		cbf_runtime_status: Arc<Mutex<CbfRuntimeStatus>>, ops_tx: mpsc::UnboundedSender<ChainOp>,
-        onchain_wallet: Arc<Wallet>
+		onchain_wallet: Arc<Wallet>,
 	) {
 		while let Some(event) = event_rx.recv().await {
 			match event {
@@ -430,13 +430,13 @@ impl CbfChainSource {
 							continue;
 						},
 					};
-                    //registered_scripts contains only LDK scripts, not onchain wallet's scripts,
-                    //as don't want to track them twice: once in bdk, once in CbfChainSource, thus
-                    //each time we receive an IndexedFilter event, we ask bdk to give us all
-                    //revealed scripts. We create all_scripts starting from onchain wallet's
-                    //scripts and extend them with LDK's ones
-                    let mut all_scripts = onchain_wallet.list_revealed_scripts();
-                    all_scripts.extend(registered_scripts.lock().expect("lock").iter().cloned());
+					//registered_scripts contains only LDK scripts, not onchain wallet's scripts,
+					//as don't want to track them twice: once in bdk, once in CbfChainSource, thus
+					//each time we receive an IndexedFilter event, we ask bdk to give us all
+					//revealed scripts. We create all_scripts starting from onchain wallet's
+					//scripts and extend them with LDK's ones
+					let mut all_scripts = onchain_wallet.list_revealed_scripts();
+					all_scripts.extend(registered_scripts.lock().expect("lock").iter().cloned());
 
 					let block_hash = indexed_filter.block_hash();
 					let matched = indexed_filter.contains_any(all_scripts.iter());
@@ -619,10 +619,7 @@ impl CbfChainSource {
 				.await?
 			},
 			FeeSource::Cbf { block_fee_cache } => {
-				let requester = match &*self.cbf_runtime_status.lock().expect("lock") {
-					CbfRuntimeStatus::Started { requester } => requester.clone(),
-					CbfRuntimeStatus::Stopped => return Err(Error::FeerateEstimationUpdateFailed),
-				};
+				let requester = self.requester()?;
 				let mut samples_sat_per_kwu: Vec<u64> = self
 					.refresh_block_fee_window(&requester, block_fee_cache)
 					.await
@@ -666,12 +663,9 @@ impl CbfChainSource {
 	}
 
 	pub(crate) async fn process_broadcast_package(&self, package: Vec<Transaction>) {
-		let requester = match &*self.cbf_runtime_status.lock().expect("lock") {
-			CbfRuntimeStatus::Started { requester } => requester.clone(),
-			CbfRuntimeStatus::Stopped => {
-				debug_assert!(false, "We should have started the chain source before broadcasting");
-				return;
-			},
+		let requester = match self.requester() {
+			Ok(requester) => requester,
+			Err(_) => return,
 		};
 
 		match Package::from_vec(package.clone()) {
@@ -692,6 +686,20 @@ impl CbfChainSource {
 						);
 					}
 				}
+			},
+		}
+	}
+
+	/// Returns a clone of the live kyoto requester, or an error if the node isn't running.
+	fn requester(&self) -> Result<Requester, Error> {
+		match &*self.cbf_runtime_status.lock().expect("lock") {
+			CbfRuntimeStatus::Started { requester } => Ok(requester.clone()),
+			CbfRuntimeStatus::Stopped => {
+				debug_assert!(
+					false,
+					"We should have started the chain source before using the requester"
+				);
+				Err(Error::FeerateEstimationUpdateFailed)
 			},
 		}
 	}

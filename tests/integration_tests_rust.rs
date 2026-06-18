@@ -1592,13 +1592,24 @@ async fn test_node_announcement_propagation() {
 	expect_channel_ready_event!(node_a, node_b.node_id());
 	expect_channel_ready_event!(node_b, node_a.node_id());
 
-	// Wait until node_b broadcasts a node announcement
-	while node_b.status().latest_node_announcement_broadcast_timestamp.is_none() {
-		tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+	// Wait until both nodes see the propagated node announcements in their network graph.
+	let mut node_announcements_propagated = false;
+	for _ in 0..600 {
+		let node_a_has_announcement = node_b
+			.network_graph()
+			.node(&NodeId::from_pubkey(&node_a.node_id()))
+			.map_or(false, |info| info.announcement_info.is_some());
+		let node_b_has_announcement = node_a
+			.network_graph()
+			.node(&NodeId::from_pubkey(&node_b.node_id()))
+			.map_or(false, |info| info.announcement_info.is_some());
+		if node_a_has_announcement && node_b_has_announcement {
+			node_announcements_propagated = true;
+			break;
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 	}
-
-	// Sleep to make sure the node announcement propagates
-	tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+	assert!(node_announcements_propagated, "Node announcements did not propagate");
 
 	// Get node info from the other node's perspective
 	let node_a_info = node_b.network_graph().node(&NodeId::from_pubkey(&node_a.node_id())).unwrap();
@@ -1879,6 +1890,8 @@ async fn do_lsps2_client_service_integration(client_trusts_lsp: bool) {
 	let new_height = generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 	service_node.sync_wallets().unwrap();
 	payer_node.sync_wallets().unwrap();
+	wait_for_node_tip(&service_node, new_height).await;
+	wait_for_node_tip(&payer_node, new_height).await;
 	expect_channel_ready_event!(payer_node, service_node.node_id());
 	expect_channel_ready_event!(service_node, payer_node.node_id());
 

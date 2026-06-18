@@ -696,6 +696,9 @@ pub(crate) async fn wait_for_outpoint_spend<E: ElectrumApi>(electrs: &E, outpoin
 
 pub(crate) async fn wait_for_node_tip(node: &Node, height: usize) {
 	exponential_backoff_poll(|| {
+		if (node.status().current_best_block.height as usize) < height {
+			let _ = node.sync_wallets();
+		}
 		(node.status().current_best_block.height as usize >= height).then_some(())
 	})
 	.await;
@@ -833,6 +836,12 @@ pub async fn open_channel_push_amt(
 	node_a: &TestNode, node_b: &TestNode, funding_amount_sat: u64, push_amount_msat: Option<u64>,
 	should_announce: bool, electrsd: &ElectrsD,
 ) -> OutPoint {
+	exponential_backoff_poll(|| {
+		let _ = node_a.sync_wallets();
+		(node_a.list_balances().spendable_onchain_balance_sats >= funding_amount_sat).then_some(())
+	})
+	.await;
+
 	if should_announce {
 		node_a
 			.open_announced_channel(
