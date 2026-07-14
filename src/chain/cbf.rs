@@ -617,7 +617,7 @@ impl CbfChainSource {
 					//each time we receive an IndexedFilter event, we ask bdk to give us all
 					//revealed scripts. We create all_scripts starting from onchain wallet's
 					//scripts and extend them with LDK's ones
-					let mut all_scripts = onchain_wallet.list_revealed_scripts();
+					let mut all_scripts = onchain_wallet.list_watched_scripts();
 					all_scripts.extend(registered_scripts.lock().expect("lock").iter().cloned());
 
 					let block_hash = indexed_filter.block_hash();
