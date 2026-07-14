@@ -121,23 +121,11 @@ pub struct CbfChainSource {
 
 #[derive(Debug)]
 enum ChainOp {
-	ConnectFull {
-		block: IndexedBlock,
-	},
-	ConnectFiltered {
-		header: Header,
-		height: u32,
-	},
-	Disconnect {
-		fork_point: BlockLocator,
-	},
-	/// Marks reaching the chain tip.
-	Synced {
-		tip_height: u32,
-	},
-	Failed {
-		error: Error,
-	},
+	ConnectFull { block: IndexedBlock },
+	ConnectFiltered { header: Header, height: u32 },
+	Disconnect { fork_point: BlockLocator },
+	Synced { tip_height: u32 },
+	Failed { error: Error },
 }
 
 struct BlockApplicator {
@@ -167,9 +155,7 @@ impl BlockApplicator {
 						);
 						continue;
 					}
-					log_info!(self.logger, "before block connected {:?}", ib.height);
 					self.chain_listener.block_connected(&ib.block, ib.height);
-					log_info!(self.logger, "after block connected {:?}", ib.height);
 					self.next_height += 1;
 					mark_syncing(&self.sync_state_tx);
 					if let Some(cache) = &self.block_fee_cache {
@@ -190,9 +176,7 @@ impl BlockApplicator {
 						);
 						continue;
 					}
-					log_info!(self.logger, "before filtered block connected {:?}", height);
 					self.chain_listener.filtered_block_connected(&header, &[], height);
-					log_info!(self.logger, "after filtered block connected {:?}", height);
 					self.next_height += 1;
 					mark_syncing(&self.sync_state_tx);
 				},
@@ -225,7 +209,6 @@ impl BlockApplicator {
 			}
 		}
 	}
-
 
 	async fn publish_synced_tip(&self, tip_height: u32) {
 		let already_published = {
@@ -273,9 +256,12 @@ const FEE_WINDOW_BLOCKS: u32 = BLOCK_FEE_CACHE_CAPACITY as u32;
 /// Electrum fee sources. Coinbase-derived rates are frequently zero on regtest/signet.
 const CBF_MIN_FEERATE_SAT_PER_KWU: u64 = 250;
 
-/// Per-block timeout when downloading a block to derive its coinbase fee rate. Kept short so a
-/// slow peer only delays a single sample rather than the whole fee update.
-const CBF_FEE_BLOCK_FETCH_TIMEOUT_SECS: u64 = 10;
+/// Per-attempt timeout when downloading a block from a peer — used both for matched blocks we apply
+/// to the listeners and for the coinbase-fee-rate samples. Kyoto queues the request and awaits a
+/// peer response with no timeout of its own, so a slow or unresponsive peer would otherwise park the
+/// fetch forever. Kept short so a single request is bounded and can be retried (or, for fees, only
+/// delays one sample) rather than stalling.
+const CBF_BLOCK_FETCH_TIMEOUT_SECS: u64 = 10;
 
 /// Recent per-block coinbase-derived fee rates, keyed by height so we can window on the tip, evict
 /// stale entries, and detect reorged-out blocks (a height whose cached hash no longer matches the
@@ -641,42 +627,37 @@ impl CbfChainSource {
 								},
 							};
 
-							match handle.await {
-								Ok(Ok(block)) => break block,
-								Ok(Err(e)) if attempt < CBF_BLOCK_FETCH_RETRIES => {
+							// Bound the download so an unresponsive peer can't park the fetch forever,
+							// then flatten the three error layers (timeout / receiver dropped / fetch
+							// error) into a single reason so the retry-or-fail decision is written once.
+							let fetched = tokio::time::timeout(
+								Duration::from_secs(CBF_BLOCK_FETCH_TIMEOUT_SECS),
+								handle,
+							)
+							.await
+							.map_err(|_| {
+								format!("timed out after {}s", CBF_BLOCK_FETCH_TIMEOUT_SECS)
+							})
+							.and_then(|recv| recv.map_err(|_| "receiver was dropped".to_string()))
+							.and_then(|fetch| fetch.map_err(|e| format!("failed: {:?}", e)));
+
+							match fetched {
+								Ok(block) => break block,
+								Err(reason) if attempt < CBF_BLOCK_FETCH_RETRIES => {
 									log_debug!(
 										logger,
-										"CBF block fetch for {} failed on attempt {}: {:?}; retrying",
+										"CBF block fetch for {} {} on attempt {}; retrying",
 										block_hash,
-										attempt,
-										e
-									);
-								},
-								Ok(Err(e)) => {
-									log_error!(
-										logger,
-										"CBF block fetch for {} failed after {} attempts: {:?}",
-										block_hash,
-										CBF_BLOCK_FETCH_RETRIES,
-										e
-									);
-									let _ =
-										ops_tx.send(ChainOp::Failed { error: Error::TxSyncFailed });
-									return;
-								},
-								Err(_) if attempt < CBF_BLOCK_FETCH_RETRIES => {
-									log_debug!(
-										logger,
-										"CBF block receiver for {} dropped on attempt {}; retrying",
-										block_hash,
+										reason,
 										attempt
 									);
 								},
-								Err(_) => {
+								Err(reason) => {
 									log_error!(
 										logger,
-										"CBF block receiver for {} dropped after {} attempts",
+										"CBF block fetch for {} {} after {} attempts; giving up",
 										block_hash,
+										reason,
 										CBF_BLOCK_FETCH_RETRIES
 									);
 									let _ =
@@ -690,9 +671,7 @@ impl CbfChainSource {
 						let height = indexed_filter.height();
 						//TODO we need to recheck that a particular height has not been
 						//reorganized, and we retrieve indeed the same block header that we
-						//received `IndexedFilter` event of.  right now this would block
-						//the further sync, as we cannot apply blocks in order.
-						//Future solution would use something like `get_header_by_hash`.
+						//received `IndexedFilter` event of.
 						match requester.get_header(height).await {
 							Ok(Some(indexed_header)) => {
 								if indexed_header.block_hash() != block_hash {
@@ -770,10 +749,6 @@ impl CbfChainSource {
 	pub(crate) fn register_output(&self, output: WatchedOutput) {
 		self.registered_scripts.lock().expect("lock").insert(output.script_pubkey);
 	}
-
-	// pub(crate) fn register_script(&self, script: ScriptBuf) {
-	// 	self.registered_scripts.lock().expect("lock").insert(script);
-	// }
 
 	pub(crate) async fn continuously_update_fee_rate_estimates(
 		&self, mut stop_sync_receiver: watch::Receiver<()>,
@@ -993,7 +968,7 @@ impl CbfChainSource {
 			}
 
 			match tokio::time::timeout(
-				Duration::from_secs(CBF_FEE_BLOCK_FETCH_TIMEOUT_SECS),
+				Duration::from_secs(CBF_BLOCK_FETCH_TIMEOUT_SECS),
 				requester.average_fee_rate(canonical_hash),
 			)
 			.await
