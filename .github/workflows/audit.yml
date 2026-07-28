@@ -27,6 +27,6 @@ jobs:
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          # The affected rustls-webpki version is only pulled in by dev dependencies
-          # pinned for backward-compatibility and integration tests.
-          ignore: RUSTSEC-2026-0098,RUSTSEC-2026-0099,RUSTSEC-2026-0104
+          # These advisories are only pulled in by dev dependencies pinned for
+          # backward-compatibility and integration tests.
+          ignore: RUSTSEC-2025-0134,RUSTSEC-2026-0098,RUSTSEC-2026-0099,RUSTSEC-2026-0104
