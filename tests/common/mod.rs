@@ -330,7 +330,7 @@ pub(crate) fn setup_bitcoind_and_electrsd() -> (BitcoinD, ElectrsD) {
 pub(crate) fn random_chain_source<'a>(
 	bitcoind: &'a BitcoinD, electrsd: &'a ElectrsD,
 ) -> TestChainSource<'a> {
-	let r = rand::random_range(0..3);
+	let r = rand::random_range(0..4);
 	match r {
 		0 => {
 			println!("Randomly setting up Esplora chain syncing...");
@@ -1063,7 +1063,6 @@ pub async fn splice_in_with_all(
 	node_a.splice_in_with_all(user_channel_id, node_b.node_id()).unwrap();
 
 	let splice_txo = expect_splice_negotiated_event!(node_a, node_b.node_id());
-	expect_splice_negotiated_event!(node_b, node_a.node_id());
 	wait_for_tx(&electrsd.client, splice_txo.txid).await;
 }
 
@@ -1537,7 +1536,6 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	assert!(splice_out_sat > 500_000);
 	node_b.splice_out(&user_channel_id_b, node_a.node_id(), &addr_a, splice_out_sat).unwrap();
 
-	expect_splice_negotiated_event!(node_a, node_b.node_id());
 	expect_splice_negotiated_event!(node_b, node_a.node_id());
 
 	generate_blocks_and_wait(&bitcoind, electrsd, 6).await;
@@ -1560,7 +1558,6 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	node_a.splice_in(&user_channel_id_a, node_b.node_id(), splice_in_sat).unwrap();
 
 	expect_splice_negotiated_event!(node_a, node_b.node_id());
-	expect_splice_negotiated_event!(node_b, node_a.node_id());
 
 	generate_blocks_and_wait(&bitcoind, electrsd, 6).await;
 	node_a.sync_wallets().unwrap();
@@ -1578,12 +1575,15 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	);
 
 	if disable_node_b_reserve {
-		let node_a_outbound_capacity_msat = node_a.list_channels()[0].outbound_capacity_msat;
-		let node_a_reserve_msat =
-			node_a.list_channels()[0].unspendable_punishment_reserve.unwrap() * 1000;
-		let zero_fee_commitments = node_a.list_channels()[0].feerate_sat_per_1000_weight == 0;
+		let node_a_channel = node_a.list_channels().into_iter().next().unwrap();
+		let node_a_outbound_capacity_msat = node_a_channel.outbound_capacity_msat;
+		let node_a_reserve_msat = node_a_channel.unspendable_punishment_reserve.unwrap() * 1000;
+		let zero_fee_commitments = node_a_channel
+			.channel_type
+			.as_ref()
+			.map_or(false, |c| c.requires_anchor_zero_fee_commitments());
 		let node_a_anchors_msat = if zero_fee_commitments { 0 } else { 2 * 330 * 1000 };
-		let funding_amount_msat = node_a.list_channels()[0].channel_value_sats * 1000;
+		let funding_amount_msat = node_a_channel.channel_value_sats * 1000;
 		// Node B does not have any reserve, so we only subtract a few items on node A's
 		// side to arrive at node B's capacity
 		let node_b_capacity_msat = funding_amount_msat

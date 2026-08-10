@@ -68,6 +68,10 @@ use crate::{
 pub struct HTLCLocator {
 	/// The channel that the HTLC was sent or received on.
 	pub channel_id: ChannelId,
+	/// The amount, in milli-satoshis, of the HTLC that was sent or received, if known.
+	///
+	/// This will be `None` for events serialized by LDK Node v0.7.0 and prior.
+	pub amount_msat: Option<u64>,
 	/// The `user_channel_id` for the channel.
 	///
 	/// Will only be `None` for events serialized with LDK Node v0.3.0 or prior, or if the
@@ -84,12 +88,14 @@ impl_writeable_tlv_based!(HTLCLocator, {
 	(1, channel_id, required),
 	(3, user_channel_id, option),
 	(5, node_id, option),
+	(7, amount_msat, option),
 });
 
 impl From<LdkHtlcLocator> for HTLCLocator {
 	fn from(value: LdkHtlcLocator) -> Self {
 		HTLCLocator {
 			channel_id: value.channel_id,
+			amount_msat: value.amount_msat,
 			user_channel_id: value.user_channel_id.map(|u| UserChannelId(u)),
 			node_id: value.node_id,
 		}
@@ -196,9 +202,7 @@ pub enum Event {
 		/// transaction.
 		claim_from_onchain_tx: bool,
 		/// The final amount forwarded, in milli-satoshis, after the fee is deducted.
-		///
-		/// The caveat described above the `total_fee_earned_msat` field applies here as well.
-		outbound_amount_forwarded_msat: Option<u64>,
+		outbound_amount_forwarded_msat: u64,
 	},
 	/// A payment for a previously-registered payment hash has been received.
 	///
@@ -271,8 +275,10 @@ pub enum Event {
 		/// This will be `None` for events serialized by LDK Node v0.2.1 and prior.
 		reason: Option<ClosureReason>,
 	},
-	/// A channel splice has been negotiated and the funding transaction is pending
-	/// confirmation on-chain.
+	/// A channel splice with local inputs or outputs has been negotiated and the funding
+	/// transaction is pending confirmation on-chain.
+	///
+	/// This event is not emitted when only the counterparty contributes to a splice.
 	SpliceNegotiated {
 		/// The `channel_id` of the channel.
 		channel_id: ChannelId,
@@ -283,7 +289,9 @@ pub enum Event {
 		/// The outpoint of the channel's splice funding transaction.
 		new_funding_txo: OutPoint,
 	},
-	/// A channel splice negotiation round has failed.
+	/// A channel splice negotiation round with local inputs or outputs has failed.
+	///
+	/// This event is not emitted when only the counterparty contributes to a splice.
 	SpliceNegotiationFailed {
 		/// The `channel_id` of the channel.
 		channel_id: ChannelId,
@@ -350,14 +358,16 @@ impl_writeable_tlv_based_enum!(Event,
 		(8, total_fee_earned_msat, option),
 		(10, skimmed_fee_msat, option),
 		(12, claim_from_onchain_tx, required),
-		(14, outbound_amount_forwarded_msat, option),
+		(14, outbound_amount_forwarded_msat, (default_value, 0)),
 		(15, prev_htlcs, (default_value_vec, vec![HTLCLocator {
 			channel_id: legacy_prev_channel_id.ok_or(lightning::ln::msgs::DecodeError::InvalidValue)?,
+			amount_msat: None,
 			user_channel_id: legacy_prev_user_channel_id.map(UserChannelId),
 			node_id: legacy_prev_node_id,
 		}])),
 		(17, next_htlcs, (default_value_vec, vec![HTLCLocator {
 			channel_id: legacy_next_channel_id.ok_or(lightning::ln::msgs::DecodeError::InvalidValue)?,
+			amount_msat: None,
 			user_channel_id: legacy_next_user_channel_id.map(UserChannelId),
 			node_id: legacy_next_node_id,
 		}])),
@@ -1215,8 +1225,7 @@ where
 					);
 					log_info!(
 						self.logger,
-						"Successfully sent payment of {}msat{} from \
-						payment hash {:?} with preimage {:?}",
+						"Successfully sent payment of {}msat{} with payment hash {}",
 						amount_msat,
 						if let Some(fee) = fee_paid_msat {
 							format!(" (fee {} msat)", fee)
@@ -1224,7 +1233,6 @@ where
 							"".to_string()
 						},
 						hex_utils::to_string(&payment_hash.0),
-						hex_utils::to_string(&payment_preimage.0)
 					);
 				});
 				let event = Event::PaymentSuccessful {
@@ -1500,7 +1508,7 @@ where
 						from_prev_str,
 						next_htlcs.len(),
 						to_next_str,
-						outbound_amount_forwarded_msat.unwrap_or(0),
+						outbound_amount_forwarded_msat,
 						fee_earned,
 					);
 					} else {
@@ -1511,7 +1519,7 @@ where
 							from_prev_str,
 							next_htlcs.len(),
 							to_next_str,
-							outbound_amount_forwarded_msat.unwrap_or(0),
+							outbound_amount_forwarded_msat,
 							fee_earned,
 						);
 					}
@@ -2120,6 +2128,14 @@ mod tests {
 			counterparty_node_id: Option<PublicKey>,
 			reason: Option<ClosureReason>,
 		},
+		PaymentForwarded {
+			prev_htlcs: Vec<HTLCLocator>,
+			next_htlcs: Vec<HTLCLocator>,
+			total_fee_earned_msat: Option<u64>,
+			skimmed_fee_msat: Option<u64>,
+			claim_from_onchain_tx: bool,
+			outbound_amount_forwarded_msat: Option<u64>,
+		},
 	}
 
 	impl_writeable_tlv_based_enum!(LegacyEvent,
@@ -2128,6 +2144,14 @@ mod tests {
 			(1, counterparty_node_id, option),
 			(2, user_channel_id, required),
 			(3, reason, upgradable_option),
+		},
+		(7, PaymentForwarded) => {
+			(8, total_fee_earned_msat, option),
+			(10, skimmed_fee_msat, option),
+			(12, claim_from_onchain_tx, required),
+			(14, outbound_amount_forwarded_msat, option),
+			(15, prev_htlcs, (default_value_vec, Vec::new())),
+			(17, next_htlcs, (default_value_vec, Vec::new())),
 		},
 	);
 
@@ -2188,6 +2212,49 @@ mod tests {
 
 		let res = EventQueue::read(&mut &persisted_bytes[..], (Arc::clone(&store), logger));
 		assert!(res.is_err());
+	}
+
+	#[test]
+	fn event_queue_defaults_legacy_missing_forwarded_amount() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(TestLogger::new());
+		let prev_htlcs = vec![HTLCLocator {
+			channel_id: ChannelId([1; 32]),
+			amount_msat: None,
+			user_channel_id: None,
+			node_id: None,
+		}];
+		let next_htlcs = vec![HTLCLocator {
+			channel_id: ChannelId([2; 32]),
+			amount_msat: None,
+			user_channel_id: None,
+			node_id: None,
+		}];
+		let legacy_event = LegacyEvent::PaymentForwarded {
+			prev_htlcs: prev_htlcs.clone(),
+			next_htlcs: next_htlcs.clone(),
+			total_fee_earned_msat: None,
+			skimmed_fee_msat: None,
+			claim_from_onchain_tx: true,
+			outbound_amount_forwarded_msat: None,
+		};
+		let expected_event = LegacyEvent::PaymentForwarded {
+			prev_htlcs,
+			next_htlcs,
+			total_fee_earned_msat: None,
+			skimmed_fee_msat: None,
+			claim_from_onchain_tx: true,
+			outbound_amount_forwarded_msat: Some(0),
+		};
+		let persisted_bytes = encode_legacy_event_queue(legacy_event);
+
+		let event_queue =
+			EventQueue::read(&mut &persisted_bytes[..], (Arc::clone(&store), logger)).unwrap();
+		assert_eq!(
+			event_queue.next_event().unwrap().encode(),
+			expected_event.encode(),
+			"legacy forwarded amount should normalize to zero"
+		);
 	}
 
 	#[tokio::test]

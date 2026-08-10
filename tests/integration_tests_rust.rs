@@ -24,10 +24,10 @@ use common::{
 	expect_channel_pending_event, expect_channel_ready_event, expect_channel_ready_events,
 	expect_event, expect_payment_claimable_event, expect_payment_received_event,
 	expect_payment_successful_event, expect_splice_negotiated_event, generate_blocks_and_wait,
-	generate_listening_addresses, invalidate_blocks, open_channel, open_channel_push_amt,
-	open_channel_with_all, premine_and_distribute_funds, premine_blocks, prepare_rbf,
-	random_chain_source, random_config, setup_bitcoind_and_electrsd, setup_builder, setup_node,
-	setup_two_nodes, splice_in_with_all, wait_for_block, wait_for_tx, InMemoryStore,
+	generate_listening_addresses, invalidate_blocks, open_channel, open_channel_no_wait,
+	open_channel_push_amt, open_channel_with_all, premine_and_distribute_funds, premine_blocks,
+	prepare_rbf, random_chain_source, random_config, setup_bitcoind_and_electrsd, setup_builder,
+	setup_node, setup_two_nodes, splice_in_with_all, wait_for_block, wait_for_tx, InMemoryStore,
 	TestChainSource, TestConfig, TestStoreType, TestSyncStore,
 };
 use electrsd::corepc_node::{self, Node as BitcoinD};
@@ -694,6 +694,61 @@ async fn start_stop_with_pathfinding_scores_sync() {
 	let node = builder.build(config.node_entropy.into()).unwrap();
 	node.start().unwrap();
 	node.stop().unwrap();
+}
+
+// The Electrum chain source drops its runtime client - and with it the tx-sync client holding all
+// `Filter` registrations - when stopped. As `ChannelMonitor`s only register their watched
+// transactions and outputs while being loaded in `Builder::build`, nothing would re-register them
+// on the next `start`, leaving the node blind to confirmations and spends of, e.g., its funding
+// outputs. So here we assert the chain source replays its registrations across a `stop`/`start`
+// cycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn electrum_registrations_survive_chain_source_restart() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Electrum(&electrsd);
+	let (node_a, node_b) = setup_two_nodes(&chain_source, false, false);
+
+	let address_a = node_a.onchain_payment().new_address().unwrap();
+
+	let premine_amount_sat = 5_000_000;
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![address_a],
+		Amount::from_sat(premine_amount_sat),
+	)
+	.await;
+	node_a.sync_wallets().unwrap();
+
+	// Opening the channel registers the funding transaction and output with the chain source's
+	// `Filter`. We leave it unconfirmed for now, so watching for it is still pending.
+	let funding_txo = open_channel_no_wait(&node_a, &node_b, 4_000_000, None, false).await;
+	wait_for_tx(&electrsd.client, funding_txo.txid).await;
+
+	// Restart node A repeatedly, which tears down and recreates its Electrum chain source every time.
+	// Note that the `ChannelMonitor`s are not reloaded here, so the registrations have to survive in
+	// the chain source itself, and they have to survive more than a single cycle, i.e., replaying
+	// them mustn't consume them.
+	for _ in 0..3 {
+		node_a.stop().unwrap();
+		node_a.start().unwrap();
+	}
+
+	// Reconnect eagerly rather than waiting on the background reconnection interval.
+	let node_addr_b = node_b.listening_addresses().unwrap().first().unwrap().clone();
+	node_a.connect(node_b.node_id(), node_addr_b, false).unwrap();
+
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	// Node A can only learn that the funding transaction confirmed if its registrations survived
+	// the restart.
+	expect_channel_ready_event!(node_a, node_b.node_id());
+	expect_channel_ready_event!(node_b, node_a.node_id());
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1706,7 +1761,9 @@ async fn splice_channel() {
 	let user_channel_id_b = expect_channel_ready_event!(node_b, node_a.node_id());
 
 	let opening_transaction_fee_sat = 156;
-	let zero_fee_commitments = node_a.list_channels()[0].feerate_sat_per_1000_weight == 0;
+	let channel = node_a.list_channels().into_iter().next().unwrap();
+	let zero_fee_commitments =
+		channel.channel_type.as_ref().map_or(false, |c| c.requires_anchor_zero_fee_commitments());
 	let closing_transaction_fee_sat = if zero_fee_commitments { 0 } else { 614 };
 	let anchor_output_sat = if zero_fee_commitments { 0 } else { 330 };
 
@@ -1752,8 +1809,7 @@ async fn splice_channel() {
 	// Splice-in funds for Node B so that it has outbound liquidity to make a payment
 	node_b.splice_in(&user_channel_id_b, node_a.node_id(), 4_000_000).unwrap();
 
-	let txo = expect_splice_negotiated_event!(node_a, node_b.node_id());
-	expect_splice_negotiated_event!(node_b, node_a.node_id());
+	let txo = expect_splice_negotiated_event!(node_b, node_a.node_id());
 
 	// Node B contributed to this splice, so wait for its funding broadcast to be classified before
 	// syncing — otherwise a sync racing the broadcaster's queue records a generic on-chain payment.
@@ -1813,7 +1869,6 @@ async fn splice_channel() {
 	node_a.splice_out(&user_channel_id_a, node_b.node_id(), &address, amount_msat / 1000).unwrap();
 
 	let txo = expect_splice_negotiated_event!(node_a, node_b.node_id());
-	expect_splice_negotiated_event!(node_b, node_a.node_id());
 
 	// Node A contributed to this splice, so wait for its funding broadcast to be classified before
 	// syncing — otherwise a sync racing the broadcaster's queue records a generic on-chain payment.
@@ -1926,8 +1981,7 @@ async fn run_rbf_splice_channel_test(confirm_original: bool) {
 	// Initiate a splice-in to create a pending splice
 	node_b.splice_in(&user_channel_id_b, node_a.node_id(), 1_000_000).unwrap();
 
-	let original_txo = expect_splice_negotiated_event!(node_a, node_b.node_id());
-	expect_splice_negotiated_event!(node_b, node_a.node_id());
+	let original_txo = expect_splice_negotiated_event!(node_b, node_a.node_id());
 
 	// Sync so the original splice candidate is recorded as a canonical wallet transaction before
 	// the RBF below replaces it. The post-RBF sync then observes the original candidate being
@@ -1964,8 +2018,7 @@ async fn run_rbf_splice_channel_test(confirm_original: bool) {
 	// bump_channel_funding_fee should succeed when there's a pending splice
 	node_b.bump_channel_funding_fee(&user_channel_id_b, node_a.node_id()).unwrap();
 
-	let rbf_txo = expect_splice_negotiated_event!(node_a, node_b.node_id());
-	expect_splice_negotiated_event!(node_b, node_a.node_id());
+	let rbf_txo = expect_splice_negotiated_event!(node_b, node_a.node_id());
 
 	assert_ne!(original_txo, rbf_txo, "RBF should produce a different funding txo");
 
@@ -2170,8 +2223,7 @@ async fn splice_payment_reorged_to_unconfirmed() {
 
 	// node_b splices in, recording a funding payment it contributed to.
 	node_b.splice_in(&user_channel_id_b, node_a.node_id(), 1_000_000).unwrap();
-	let splice_txo = expect_splice_negotiated_event!(node_a, node_b.node_id());
-	expect_splice_negotiated_event!(node_b, node_a.node_id());
+	let splice_txo = expect_splice_negotiated_event!(node_b, node_a.node_id());
 	wait_for_tx(&electrsd.client, splice_txo.txid).await;
 	// Ensure node_b classified the splice before syncing so the test exercises a funding payment's
 	// reorg rather than a generic on-chain payment's.
@@ -2248,8 +2300,7 @@ async fn splice_in_rbf_joins_counterparty_splice() {
 	// node_b (which didn't fund the channel open, so holds the on-chain balance) initiates a
 	// splice-in; node_a does not contribute to this first candidate.
 	node_b.splice_in(&user_channel_id_b, node_a.node_id(), 1_000_000).unwrap();
-	let counterparty_txo = expect_splice_negotiated_event!(node_a, node_b.node_id());
-	expect_splice_negotiated_event!(node_b, node_a.node_id());
+	let counterparty_txo = expect_splice_negotiated_event!(node_b, node_a.node_id());
 	wait_for_tx(&electrsd.client, counterparty_txo.txid).await;
 	node_a.sync_wallets().unwrap();
 	node_b.sync_wallets().unwrap();
